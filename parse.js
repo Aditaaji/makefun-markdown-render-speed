@@ -1,19 +1,19 @@
-// A drop-in replacement for marked 18.1.3 (default options: gfm on, breaks
-// off, pedantic off, async off). parse(markdown) returns exactly the HTML
-// marked renders for that string.
+// Pengganti drop-in untuk marked 18.1.3 (opsi default: gfm aktif,
+// breaks mati, pedantic mati, async mati). parse(markdown)
+// mengembalikan persis HTML yang dirender marked untuk string itu.
 //
-// How it works: a hand-written fast renderer (fast.js) handles the
-// constructs that dominate real documents; anything outside its envelope
-// falls back to the vendored marked 18.1.3
-// (vendor/marked/marked.esm.js, MIT, with its LICENSE and NOTICE), so
-// correctness never depends on the fast path alone. parse keeps no state
-// between calls: it returns for each input what it returns for that input
-// alone.
+// Cara kerja: renderer cepat tulisan tangan (fast.js) menangani
+// konstruk yang mendominasi dokumen nyata; apa pun di luar
+// jangkauannya jatuh ke marked 18.1.3 yang di-vendor
+// (vendor/marked/marked.esm.js, MIT, beserta LICENSE dan NOTICE-nya),
+// jadi kebenaran tidak pernah bergantung pada jalur cepat saja.
+// parse tidak menyimpan state antar panggilan: tiap masukan
+// menghasilkan keluaran yang sama bila dipanggil sendiri.
 
 import { marked } from './vendor/marked/marked.esm.js';
-import { fastRender } from './fast.js';
+import { renderFast } from './fast.js';
 
-/** The HTML marked 18.1.3 renders for `markdown`, with marked's defaults. */
+/** HTML yang dirender marked 18.1.3 untuk `markdown`, dengan default marked. */
 export function parse(markdown) {
-  return fastRender(markdown, (input) => marked.parse(input));
+  return renderFast(markdown, (input) => marked.parse(input));
 }

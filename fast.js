@@ -1,129 +1,39 @@
-// fast.js — a fast renderer that produces byte-identical output to
-// marked 18.1.3 with its defaults (gfm on, breaks off, pedantic off,
-// async off), written for the make.fun "markdown-render-speed-02"
-// competition.
+// fast.js — renderer cepat yang keluarannya sama persis (byte-identical)
+// dengan marked 18.1.3 pada opsi default (gfm aktif, breaks mati,
+// pedantic mati, async mati). Dibuat untuk kompetisi make.fun
+// "markdown-render-speed-02".
 //
-// Layout of this file:
-//   1. Small string/character helpers shared by both engines.
-//   2. Inline pattern constants and the label/link scanners.
-//   3. InlineEngine — the inline tokenizer/renderer (one instance per
-//      document, holding the link definitions and the shared inline state).
-//   4. Block-level line classifiers and definition scanning.
-//   5. BlockParser — the block tokenizer (one instance per block context;
-//      list items and blockquotes recurse through fresh instances that
-//      share the link table).
-//   6. The renderer that turns block tokens into HTML.
-//   7. fastRender — the entry point, with a per-block fallback to the
-//      vendored marked for anything the fast path cannot render.
+// Susunan file ini:
+//   A. Helper string kecil yang dipakai kedua mesin.
+//   B. Kelas karakter (punct, word, dsb.) untuk aturan emphasis.
+//   C. Pola inline, pemindai label/link, dan masking delimiter.
+//   D. Inline — tokenizer/renderer inline (satu instance per dokumen).
+//   E. Pengenal baris level blok dan pemindai definisi.
+//   F. BlockLexer — tokenizer blok (list dan blockquote memakai
+//      instance baru yang berbagi tabel link).
+//   G. Pola list/blockquote dan cache-nya.
+//   H. Renderer: token blok -> HTML.
+//   I. renderFast — titik masuk, dengan fallback per blok ke marked
+//      yang di-vendor.
 //
-// The fast path only claims documents it can render exactly; the entry
-// point hands short inputs straight to marked and falls back block by
-// block on any error, so a mistake in the fast path degrades to marked
-// output instead of wrong output.
+// Jalur cepat hanya mengklaim dokumen yang bisa dirender persis;
+// masukan pendek langsung ke marked, dan tiap blok yang gagal
+// dilempar ke marked, jadi kesalahan jalur cepat berujung pada
+// keluaran marked, bukan keluaran salah.
 
-// ================================================================ 1. string helpers
+// ================================================================ A. helper string
 
-// HTML escaping. With encode=true every & < > " ' is escaped; with
-// encode=false (marked's noEncode) an & that starts a valid entity or
-// numeric reference is left alone.
-const ESC_TEST = /[&<>"']/;
-const ESC_TEST_KEEP_ENT = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/;
-const ESC_RE = /[&<>"']/g;
-const ESC_RE_KEEP_ENT = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
-const ESC_CHARS = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-
-function escapeHtml(text, encode) {
-  if (encode) {
-    if (ESC_TEST.test(text)) return text.replace(ESC_RE, (ch) => ESC_CHARS[ch]);
-    return text;
-  }
-  if (ESC_TEST_KEEP_ENT.test(text)) return text.replace(ESC_RE_KEEP_ENT, (ch) => ESC_CHARS[ch]);
-  return text;
-}
-
-// Decode numeric character references only — marked never decodes named
-// entities. &#0;, surrogates and values above 0x10FFFF become U+FFFD;
-// &#38; decodes to "&amp;" (the caller re-escapes it); &#60; to "&lt;".
-const NUM_REF_TEST = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
-const NUM_REF_RE = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
-
-function decodeNumericRefs(text) {
-  if (!NUM_REF_TEST.test(text)) return text;
-  return text.replace(NUM_REF_RE, (match, decimal, hex) => {
-    if (decimal === undefined && hex === undefined) return '&amp;';
-    const code = decimal === undefined ? parseInt(hex, 16) : parseInt(decimal, 10);
-    if (code === 0 || code > 1114111 || (code >= 55296 && code <= 57343)) return '\uFFFD';
-    if (code === 38) return '&amp;';
-    return String.fromCodePoint(code);
-  });
-}
-
-// cleanUrl: encodeURI, then put %25 back to %. A lone surrogate makes
-// encodeURI throw, which drops the whole link.
-const PCT25_RE = /%25/g;
-
-function cleanUrl(href) {
-  try {
-    return encodeURI(href).replace(PCT25_RE, '%');
-  } catch {
-    return null;
-  }
-}
-
-// Drop trailing blank lines beyond the first one.
-const BLANK_RE = /^[ \t]*$/;
-
-function stripTrailingBlanks(text) {
-  const parts = text.split('\n');
-  let last = parts.length - 1;
-  while (last >= 0 && BLANK_RE.test(parts[last])) last--;
-  if (parts.length - last <= 2) return text;
-  return parts.slice(0, last + 1).join('\n');
-}
-
-// Normalise a link reference label: trim, collapse inner whitespace to
-// single spaces, then lowercase/uppercase/lowercase (a rough Unicode
-// case fold, matching marked's behaviour).
-const WS_RUN_RE = /\s+/g;
-
-function normalizeLabel(label) {
-  return label.trim().replace(WS_RUN_RE, ' ').toLowerCase().toUpperCase().toLowerCase();
-}
-
-// Split a table row into cells. A \| stays literal; cells are trimmed;
-// empty edge cells are dropped; with `count` the row is cut or padded
-// to exactly that many cells.
-const PIPE_RE = /\|/g;
-const PIPE_SPLIT_RE = / \|/;
-const ESC_PIPE_RE = /\\\|/g;
-
-function splitTableRow(row, count) {
-  const markedPipes = row.replace(PIPE_RE, (ch, offset, whole) => {
-    let escaped = false;
-    for (let pos = offset; --pos >= 0 && whole[pos] === '\\';) escaped = !escaped;
-    return escaped ? '|' : ' |';
-  });
-  const cells = markedPipes.split(PIPE_SPLIT_RE);
-  if (!cells[0].trim()) cells.shift();
-  if (cells.length > 0 && !cells.at(-1).trim()) cells.pop();
-  if (count) {
-    if (cells.length > count) cells.splice(count);
-    else while (cells.length < count) cells.push('');
-  }
-  for (let i = 0; i < cells.length; i++) cells[i] = cells[i].trim().replace(ESC_PIPE_RE, '|');
-  return cells;
-}
-
-// Balanced-paren check over a string (a backslash skips the next char).
-// -1 = no parens at all, or balanced; -2 = an opening paren is left
-// over; >= 0 = index of an unmatched closing paren.
-function parenBalance(str, pair) {
+// Cek paren berimbang pada sebuah string (backslash melewati karakter
+// berikutnya). -1 = tidak ada paren, atau berimbang; -2 = ada '(' yang
+// tidak tertutup; >= 0 = indeks ')' yang tidak berpasangan.
+function parenCheck(str, pair) {
   if (str.indexOf(pair[0]) === -1 && str.indexOf(pair[1]) === -1) return -1;
   let depth = 0;
   for (let i = 0; i < str.length; i++) {
-    if (str[i] === '\\') i++;
-    else if (str[i] === pair[0]) depth++;
-    else if (str[i] === pair[1]) {
+    const c = str[i];
+    if (c === '\\') i++;
+    else if (c === pair[0]) depth++;
+    else if (c === pair[1]) {
       depth--;
       if (depth < 0) return i;
     }
@@ -131,8 +41,8 @@ function parenBalance(str, pair) {
   return depth > 0 ? -2 : -1;
 }
 
-// Expand tabs to spaces, tracking the column starting at `start`.
-function expandTabs(str, start = 0) {
+// Kembangkan tab jadi spasi dengan melacak kolom mulai dari `start`.
+function expandTabStops(str, start = 0) {
   let col = start;
   let out = '';
   for (const ch of str) {
@@ -148,91 +58,183 @@ function expandTabs(str, start = 0) {
   return out;
 }
 
-// Dedent fenced-code content by the opening fence's indent.
-const FENCE_INDENT_RE = /^(\s+)(?:```)/;
-const LEADING_SPACE_RE = /^[\s]+/;
+// Dedent isi fenced code sebesar indent baris pembuka fence.
+const FENCE_INDENT = /^(\s+)(?:```)/;
+const LEAD_WS = /^[\s]+/;
 
-function dedentFence(fenceLine, content) {
-  const match = fenceLine.match(FENCE_INDENT_RE);
-  if (match === null) return content;
-  const indent = match[1];
+function dedentCode(fenceLine, content) {
+  const m = fenceLine.match(FENCE_INDENT);
+  if (m === null) return content;
+  const indent = m[1];
   return content.split('\n').map((line) => {
-    const leading = line.match(LEADING_SPACE_RE);
+    const leading = line.match(LEAD_WS);
     if (leading === null) return line;
     return line.slice(Math.min(leading[0].length, indent.length));
   }).join('\n');
 }
 
-// ================================================================ character classes
+// Escaping HTML. encode=true meng-escape semua & < > " '; encode=false
+// (noEncode milik marked) membiarkan & yang memulai entity atau
+// referensi numerik yang valid.
+const ESC_TEST = /[&<>"']/;
+const ESC_TEST_KEEP_ENT = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/;
+const ESC_RE = /[&<>"']/g;
+const ESC_RE_KEEP_ENT = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
+const HTML_ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
-// A Unicode punctuation/symbol character.
-const PUNCT_SYM_RE = /[\p{P}\p{S}]/u;
-const ALNUM_RE = /[\p{L}\p{N}]/u;
-
-function isPunct(ch) {
-  return ch !== '' && PUNCT_SYM_RE.test(ch);
-}
-// GFM "punct": punctuation/symbol except '~'.
-function isGfmPunct(ch) {
-  return ch !== '' && ch !== '~' && PUNCT_SYM_RE.test(ch);
-}
-// GFM "notPunctSpace": not whitespace and not punct/symbol — or '~'.
-function isGfmWord(ch) {
-  return ch !== '' && (ch === '~' || (!/\s/.test(ch) && !PUNCT_SYM_RE.test(ch)));
-}
-// GFM "punctSpace": whitespace or punct/symbol, except '~'.
-function isGfmPunctSpace(ch) {
-  return ch !== '' && ch !== '~' && (/\s/.test(ch) || PUNCT_SYM_RE.test(ch));
-}
-// Non-GFM "notPunctSpace" / "punctSpace": here '~' counts as punctuation.
-// Used by the '_' closer and the '~' closer, which both use the non-GFM
-// replacements — only '*' uses the GFM ones above.
-function isPlainWord(ch) {
-  return ch !== '' && !/\s/.test(ch) && !PUNCT_SYM_RE.test(ch);
-}
-function isPlainPunctSpace(ch) {
-  return ch !== '' && (/\s/.test(ch) || PUNCT_SYM_RE.test(ch));
-}
-function isAlnum(ch) {
-  return ch !== '' && ALNUM_RE.test(ch);
-}
-// The punctuation check used by emphasis/del openers: whitespace or
-// punct/symbol, but not '*' or '_'.
-function isOpenerPunct(ch) {
-  return ch !== '' && ch !== '*' && ch !== '_' && (/\s/.test(ch) || PUNCT_SYM_RE.test(ch));
+function escHtml(text, encode) {
+  if (encode) {
+    if (ESC_TEST.test(text)) return text.replace(ESC_RE, (ch) => HTML_ESC_MAP[ch]);
+    return text;
+  }
+  if (ESC_TEST_KEEP_ENT.test(text)) return text.replace(ESC_RE_KEEP_ENT, (ch) => HTML_ESC_MAP[ch]);
+  return text;
 }
 
-// ================================================================ 2. inline patterns
+// Hanya decode referensi karakter numerik — marked tidak pernah
+// mendekode named entity. &#0;, surrogate, dan nilai di atas 0x10FFFF
+// jadi U+FFFD; &#38; jadi "&amp;" (pemanggil meng-escape ulang);
+// &#60; jadi "&lt;".
+const NUMREF_TEST = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
+const NUMREF_RE = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
 
-const ASCII_PUNCT = new Set('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'.split(''));
-// A backslash escape: backslash + ASCII punctuation.
-const BACKSLASH_ESC_RE = /^\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])/;
-const CODE_SPAN_RE = /^(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/;
-const AUTOLINK_RE = /^<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^\s\x00-\x1f<>]*|[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+(@)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(?![-_]))>/;
-const TAG_RE = /^<!--(?:-?>|[\s\S]*?-->)|^<\/[a-zA-Z][a-zA-Z0-9-]*\s*>|^<[a-zA-Z][a-zA-Z0-9-]*(?:\s+[a-zA-Z:_][\w.:-]*(?:\s*=\s*"[^"]*"|\s*=\s*'[^']*'|\s*=\s*[^\s"'=<>`]+)?)*?\s*\/?>|^<\?[\s\S]*?\?>|^<![a-zA-Z]+\s[\s\S]*?>|^<!\[CDATA\[[\s\S]*?\]\]>/;
-const OPEN_A_RE = /^<a /i;
-const CLOSE_A_RE = /^<\/a>/i;
-const OPEN_PRE_RE = /^<(pre|code|kbd|script)(\s|>)/i;
-const CLOSE_PRE_RE = /^<\/(pre|code|kbd|script)(\s|>)/i;
-// GFM extended autolinks: mailto:/xmpp: | scheme://... | www.... | email.
-const EMAIL_RE = /[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
-const EMAIL_PROTO_RE = /^(?:mailto:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])|xmpp:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?)/;
-const EXT_URL_RE = /^(?:mailto:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])|xmpp:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?)|^((?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*|^[A-Za-z0-9._+-]+(@)[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
-const BACKPEDAL_RE = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
-const PUNCT_OUTSIDE_CODE_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
-const SKIP_BLOCK_RE = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
-const REFLINK_RE = /!?\[(?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*?\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?\]\[(?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999}\]|!?\[(?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999}\](?:\[\])?(?!\()/g;
-const INLINE_LINK_START_RE = /^!?\[.*\]\(/s;
-
-// Resolve backslash escapes of punctuation inside a href/title.
-const ESCAPED_PUNCT_RE = /\\([\p{P}\p{S}])/gu;
-function unescapePunct(str) {
-  return str.replace(ESCAPED_PUNCT_RE, '$1');
+function decodeNumRefs(text) {
+  if (!NUMREF_TEST.test(text)) return text;
+  return text.replace(NUMREF_RE, (match, decimal, hex) => {
+    if (decimal === undefined && hex === undefined) return '&amp;';
+    const code = decimal === undefined ? parseInt(hex, 16) : parseInt(decimal, 10);
+    if (code === 0 || code > 1114111 || (code >= 55296 && code <= 57343)) return '\uFFFD';
+    if (code === 38) return '&amp;';
+    return String.fromCodePoint(code);
+  });
 }
 
-// The ']' matching the '[' at src[j], allowing one level of nested
-// [..] groups inside. Returns the index of the matching ']', or -1.
-function findMatchingBracket(src, j) {
+// tidyHref: encodeURI, lalu kembalikan %25 menjadi %. Satu lone
+// surrogate membuat encodeURI melempar, dan link itu gugur.
+const PCT_RE = /%25/g;
+
+function tidyHref(href) {
+  try {
+    return encodeURI(href).replace(PCT_RE, '%');
+  } catch {
+    return null;
+  }
+}
+
+// Buang baris kosong di ujung, sisakan paling banyak satu.
+const BLANK_RE = /^[ \t]*$/;
+
+function trimTrailingBlank(text) {
+  const parts = text.split('\n');
+  let last = parts.length - 1;
+  while (last >= 0 && BLANK_RE.test(parts[last])) last--;
+  if (parts.length - last <= 2) return text;
+  return parts.slice(0, last + 1).join('\n');
+}
+
+// Normalisasi label referensi link: trim, lipat whitespace dalam jadi
+// satu spasi, lalu lowercase/uppercase/lowercase (perkiraan Unicode
+// case fold, mengikuti marked).
+const WS_RUN = /\s+/g;
+
+function foldLabel(label) {
+  return label.trim().replace(WS_RUN, ' ').toLowerCase().toUpperCase().toLowerCase();
+}
+
+// Pecah satu baris tabel jadi sel. \| tetap literal; sel di-trim;
+// sel kosong di tepi dibuang; dengan `count` baris dipotong/ditambah
+// sampai tepat sebanyak itu.
+const PIPE_ALL = /\|/g;
+const PIPE_SEP = / \|/;
+const ESCAPED_PIPE = /\\\|/g;
+
+function splitRowCells(row, count) {
+  const markedPipes = row.replace(PIPE_ALL, (ch, offset, whole) => {
+    let escaped = false;
+    for (let pos = offset; --pos >= 0 && whole[pos] === '\\';) escaped = !escaped;
+    return escaped ? '|' : ' |';
+  });
+  const cells = markedPipes.split(PIPE_SEP);
+  if (!cells[0].trim()) cells.shift();
+  if (cells.length > 0 && !cells.at(-1).trim()) cells.pop();
+  if (count) {
+    if (cells.length > count) cells.splice(count);
+    else while (cells.length < count) cells.push('');
+  }
+  for (let i = 0; i < cells.length; i++) cells[i] = cells[i].trim().replace(ESCAPED_PIPE, '|');
+  return cells;
+}
+
+// ================================================================ B. kelas karakter
+
+// Satu karakter punctuation/symbol Unicode.
+const PUNCT_SYM = /[\p{P}\p{S}]/u;
+const ALNUM_CLASS = /[\p{L}\p{N}]/u;
+
+function isPunctCh(ch) {
+  return ch !== '' && PUNCT_SYM.test(ch);
+}
+// "punct" GFM: punctuation/symbol kecuali '~'.
+function isGfmPunctCh(ch) {
+  return ch !== '' && ch !== '~' && PUNCT_SYM.test(ch);
+}
+// "notPunctSpace" GFM: bukan whitespace dan bukan punct/symbol — atau '~'.
+function isGfmWordCh(ch) {
+  return ch !== '' && (ch === '~' || (!/\s/.test(ch) && !PUNCT_SYM.test(ch)));
+}
+// "punctSpace" GFM: whitespace atau punct/symbol, kecuali '~'.
+function isGfmPunctSpaceCh(ch) {
+  return ch !== '' && ch !== '~' && (/\s/.test(ch) || PUNCT_SYM.test(ch));
+}
+// "notPunctSpace" / "punctSpace" non-GFM: di sini '~' dihitung
+// punctuation. Dipakai closer '_' dan closer '~', yang keduanya memakai
+// pengganti non-GFM — hanya '*' yang memakai versi GFM di atas.
+function isPlainWordCh(ch) {
+  return ch !== '' && !/\s/.test(ch) && !PUNCT_SYM.test(ch);
+}
+function isPlainPunctSpaceCh(ch) {
+  return ch !== '' && (/\s/.test(ch) || PUNCT_SYM.test(ch));
+}
+function isAlnumCh(ch) {
+  return ch !== '' && ALNUM_CLASS.test(ch);
+}
+// Cek punctuation untuk opener emphasis/del: whitespace atau
+// punct/symbol, tapi bukan '*' atau '_'.
+function isOpenerPunctCh(ch) {
+  return ch !== '' && ch !== '*' && ch !== '_' && (/\s/.test(ch) || PUNCT_SYM.test(ch));
+}
+
+// ================================================================ C. pola inline
+
+const ASCII_PUNCT_SET = new Set('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'.split(''));
+// Escape backslash: backslash + punctuation ASCII.
+const BACKSLASH_ESC = /^\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])/;
+const CODE_SPAN = /^(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/;
+const AUTOLINK = /^<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^\s\x00-\x1f<>]*|[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+(@)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(?![-_]))>/;
+const HTML_TAG = /^<!--(?:-?>|[\s\S]*?-->)|^<\/[a-zA-Z][a-zA-Z0-9-]*\s*>|^<[a-zA-Z][a-zA-Z0-9-]*(?:\s+[a-zA-Z:_][\w.:-]*(?:\s*=\s*"[^"]*"|\s*=\s*'[^']*'|\s*=\s*[^\s"'=<>`]+)?)*?\s*\/?>|^<\?[\s\S]*?\?>|^<![a-zA-Z]+\s[\s\S]*?>|^<!\[CDATA\[[\s\S]*?\]\]>/;
+const OPEN_ANCHOR = /^<a /i;
+const CLOSE_ANCHOR = /^<\/a>/i;
+const OPEN_RAW_TAG = /^<(pre|code|kbd|script)(\s|>)/i;
+const CLOSE_RAW_TAG = /^<\/(pre|code|kbd|script)(\s|>)/i;
+// Autolink GFM tambahan: mailto:/xmpp: | scheme://... | www.... | email.
+const EMAIL_ADDR = /[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
+const EMAIL_SCHEME = /^(?:mailto:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])|xmpp:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?)/;
+const EXTENDED_URL = /^(?:mailto:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])|xmpp:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?)|^((?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*|^[A-Za-z0-9._+-]+(@)[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
+const BACKPEDAL = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
+const PUNCT_OUTSIDE_CODE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const SKIP_BLOCKS = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+const REF_LINK = /!?\[(?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*?\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?\]\[(?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999}\]|!?\[(?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999}\](?:\[\])?(?!\()/g;
+const INLINE_LINK_START = /^!?\[.*\]\(/s;
+
+// Selesaikan escape backslash atas punctuation di dalam href/title.
+const ESCAPED_PUNCT = /\\([\p{P}\p{S}])/gu;
+function unescPunct(str) {
+  return str.replace(ESCAPED_PUNCT, '$1');
+}
+
+// ']' yang cocok dengan '[' di src[j], dengan satu tingkat grup [..]
+// bersarang di dalamnya. Kembalikan indeks ']' yang cocok, atau -1.
+function findCloseBracket(src, j) {
   const n = src.length;
   let k = j + 1;
   while (k < n) {
@@ -258,27 +260,27 @@ function findMatchingBracket(src, j) {
   return -1;
 }
 
-// Scan a [label] starting at src[i] === '['. Returns {label, end} where
-// end is the index just past the closing ']', or null. Nested groups are
-// one level deep (marked's label pattern only allows a single nested
-// [...] group).
-function readLabel(src, i) {
+// Pindai [label] mulai dari src[i] === '['. Kembalikan {label, end}
+// dengan end indeks tepat setelah ']' penutup, atau null. Grup
+// bersarang hanya satu tingkat (pola label marked hanya mengizinkan
+// satu grup [...] di dalam).
+function scanLabel(src, i) {
   const n = src.length;
   let j = i + 1;
   while (j < n) {
     const ch = src[j];
     if (ch === '\\') { j += 2; continue; }
     if (ch === '`') {
-      // A code span in a label: marked's pattern allows the closing
-      // backtick run to be ANY length, not necessarily equal to the
-      // opener — e.g. `` ``url` `` is one code span. But the pattern
-      // also has the `` ``+(?=\]) `` alternative — a run of TWO or more
-      // backticks immediately before ']' — and its lazy matching prefers
-      // the shorter label, so check that FIRST (only for runs of length
-      // >= 2): such a run ends the label here rather than spanning to a
-      // far-away backtick. A SINGLE backtick before ']' does NOT match
-      // that alternative, so it must be a code span (find a closing run)
-      // or the label fails.
+      // Code span di dalam label: pola marked mengizinkan run backtick
+      // penutup dengan panjang BERAPA PUN, tidak harus sama dengan
+      // pembuka — mis. `` ``url` `` adalah satu code span. Tapi pola itu
+      // juga punya alternatif `` ``+(?=\]) `` — run DUA backtick atau
+      // lebih tepat sebelum ']' — dan pencocokan lazy-nya memilih label
+      // yang lebih pendek, jadi cek itu DULU (hanya untuk run panjang
+      // >= 2): run seperti itu mengakhiri label di sini, bukan merentang
+      // ke backtick yang jauh. Satu backtick sebelum ']' TIDAK cocok
+      // dengan alternatif itu, jadi ia harus berupa code span (cari run
+      // penutup) atau labelnya gagal.
       let k = j;
       while (k < n && src[k] === '`') k++;
       if (k - j >= 2 && src[k] === ']') { j = k; continue; }
@@ -297,7 +299,7 @@ function readLabel(src, i) {
       return null;
     }
     if (ch === '[') {
-      const m = findMatchingBracket(src, j);
+      const m = findCloseBracket(src, j);
       if (m < 0) return null;
       j = m + 1;
       continue;
@@ -308,21 +310,22 @@ function readLabel(src, i) {
   return null;
 }
 
-// Does the label contain a tag that starts inside it and runs past its
-// end (marked's check for a tag overrunning the label)? `labelStart` is
-// the index of the label's first char in `src`; `labelLen` its length.
-function labelTagOverruns(src, labelStart, labelLen) {
+// Apakah label mengandung tag yang mulai di dalamnya dan berjalan
+// melewati ujungnya (cek marked untuk tag yang meluber keluar label)?
+// `labelStart` indeks karakter pertama label di `src`; `labelLen`
+// panjangnya.
+function tagSpillsFromLabel(src, labelStart, labelLen) {
   const label = src.slice(labelStart, labelStart + labelLen);
   if (!label.includes('<')) return false;
   for (let s = 0; s < label.length; s++) {
     if (label[s] === '\\') { s++; continue; }
     if (label[s] === '`') {
-      const m = CODE_SPAN_RE.exec(label.slice(s));
+      const m = CODE_SPAN.exec(label.slice(s));
       if (m) { s += m[0].length - 1; continue; }
     }
     if (label[s] !== '<') continue;
     const rest = src.slice(labelStart + s);
-    const match = TAG_RE.exec(rest) || AUTOLINK_RE.exec(rest);
+    const match = HTML_TAG.exec(rest) || AUTOLINK.exec(rest);
     if (match) {
       if (match[0].length > label.length - s) return true;
       s += match[0].length - 1;
@@ -331,60 +334,61 @@ function labelTagOverruns(src, labelStart, labelLen) {
   return false;
 }
 
-// Is there a link (inline or reference) inside `text`? Used by the
-// masking step and by the reference-link tokenizer's own check.
-function containsLink(text, links) {
+// Apakah ada link (inline atau referensi) di dalam `text`? Dipakai
+// langkah masking dan cek tokenizer reference-link itu sendiri.
+function hasAnyLink(text, links) {
   if (!text.includes('[')) return false;
-  for (const m of text.matchAll(SKIP_BLOCK_RE)) {
-    if (INLINE_LINK_START_RE.test(m[0]) && text.charAt(m.index - 1) !== '!') return true;
+  for (const m of text.matchAll(SKIP_BLOCKS)) {
+    if (INLINE_LINK_START.test(m[0]) && text.charAt(m.index - 1) !== '!') return true;
   }
-  for (const m of text.matchAll(REFLINK_RE)) {
+  for (const m of text.matchAll(REF_LINK)) {
     const str = m[0];
     const lastBracket = str.lastIndexOf('[');
-    if (!(str.charAt(0) === '!' || !Object.hasOwn(links, normalizeLabel(str.slice(lastBracket + 1, -1)))) &&
-        !(lastBracket > 1 && containsLink(str.slice(1, lastBracket - 1), links))) return true;
+    if (!(str.charAt(0) === '!' || !Object.hasOwn(links, foldLabel(str.slice(lastBracket + 1, -1)))) &&
+        !(lastBracket > 1 && hasAnyLink(str.slice(1, lastBracket - 1), links))) return true;
   }
   return false;
 }
 
-// Mask one reference-link match for the emphasis/delimiter closer
-// search: the label text is replaced by filler so delimiter runs inside
-// a defined reference label cannot close an emphasis.
-function maskRefLink(match, links) {
+// Mask satu kecocokan reference-link untuk pencarian closer
+// emphasis/delimiter: teks label diganti filler supaya run delimiter
+// di dalam label referensi yang terdefinisi tidak bisa menutup emphasis.
+function maskReference(match, links) {
   const lastBracket = match.lastIndexOf('[');
-  if (!Object.hasOwn(links, normalizeLabel(match.slice(lastBracket + 1, -1)))) return match;
+  if (!Object.hasOwn(links, foldLabel(match.slice(lastBracket + 1, -1)))) return match;
   if (lastBracket > 1 && match.charAt(0) !== '!') {
     const inner = match.slice(1, lastBracket - 1);
-    if (containsLink(inner, links)) {
-      return '[' + inner.replace(REFLINK_RE, (m) => maskRefLink(m, links)) + '][' +
+    if (hasAnyLink(inner, links)) {
+      return '[' + inner.replace(REF_LINK, (m) => maskReference(m, links)) + '][' +
         'a'.repeat(match.length - lastBracket - 2) + ']';
     }
   }
   return '[' + 'a'.repeat(match.length - 2) + ']';
 }
 
-// Mask a container string for the emphasis/delimiter closer search: hide
-// delimiter runs that sit inside links, code spans, HTML tags, defined
-// reference labels and escaped punctuation. The mask keeps the length, so
-// positions in the masked string line up with the real string.
-function maskDelimiters(src, links) {
+// Mask string kontainer untuk pencarian closer emphasis/delimiter:
+// sembunyikan run delimiter yang ada di dalam link, code span, tag
+// HTML, label referensi terdefinisi, dan punctuation yang di-escape.
+// Mask menjaga panjang, jadi posisi di string hasil mask sejajar
+// dengan string aslinya.
+function maskDelims(src, links) {
   let masked = src;
   if (links && src.includes('[')) {
-    masked = masked.replace(REFLINK_RE, (m) => maskRefLink(m, links));
+    masked = masked.replace(REF_LINK, (m) => maskReference(m, links));
   }
-  // The two masking passes below only change anything when the text
-  // contains a backtick/backslash (punct masking) or a
-  // bracket/backtick/angle-bracket (block skip); skip the expensive
-  // regex scans otherwise.
+  // Dua pass masking di bawah hanya mengubah sesuatu bila teks
+  // mengandung backtick/backslash (masking punct) atau
+  // bracket/backtick/angle-bracket (skip blok); lewati pemindaian
+  // regex yang mahal bila tidak ada.
   if (src.includes('`') || src.includes('\\')) {
-    masked = masked.replace(PUNCT_OUTSIDE_CODE_RE, (whole, span, escaped) => {
+    masked = masked.replace(PUNCT_OUTSIDE_CODE, (whole, span, escaped) => {
       if (escaped) return '+'.repeat(whole.length);
       if (span) return span + whole.slice(span.length, -span.length).replace(/`/g, '+') + span;
       return whole;
     });
   }
   if (src.includes('[') || src.includes('`') || src.includes('<')) {
-    masked = masked.replace(SKIP_BLOCK_RE, (whole, _before, codeRun) => {
+    masked = masked.replace(SKIP_BLOCKS, (whole, _before, codeRun) => {
       const prefixLen = codeRun ? codeRun.length : 0;
       return whole.slice(0, prefixLen) + '[' + 'a'.repeat(whole.length - prefixLen - 2) + ']';
     });
@@ -392,9 +396,9 @@ function maskDelimiters(src, links) {
   return masked;
 }
 
-// The code point ending just before index `idx`, and the one starting at
-// `idx` (surrogate-pair aware — the closer rules run with the `u` flag).
-function codePointBefore(str, idx) {
+// Code point yang berakhir tepat sebelum indeks `idx`, dan yang mulai
+// di `idx` (sadar surrogate-pair — aturan closer berjalan dengan flag `u`).
+function cpBefore(str, idx) {
   if (idx <= 0) return '';
   const low = str.charCodeAt(idx - 1);
   if (low >= 0xDC00 && low <= 0xDFFF && idx >= 2) {
@@ -403,7 +407,7 @@ function codePointBefore(str, idx) {
   }
   return str[idx - 1];
 }
-function codePointAfter(str, idx) {
+function cpAfter(str, idx) {
   if (idx >= str.length) return '';
   const high = str.charCodeAt(idx);
   if (high >= 0xD800 && high <= 0xDBFF && idx + 1 < str.length) {
@@ -413,54 +417,54 @@ function codePointAfter(str, idx) {
   return str[idx];
 }
 
-// Classify a delimiter run for the closer search (marked's delimiter
-// groups). `ch` is '*' or '_' or '~'; `prev` is the char before the run
-// ('' at the start), `next` the char after it ('' at the end). Returns 0
-// (not a closer at all), 1/2 (plain closer), 3/4 (cannot close —
-// absorbed into the opener count), 5/6 (conditional closer — rule of
-// 3s / previous-char check).
-function classifyCloser(ch, prev, next) {
+// Klasifikasikan run delimiter untuk pencarian closer (grup delimiter
+// marked). `ch` adalah '*' atau '_' atau '~'; `prev` karakter sebelum
+// run ('' di awal), `next` karakter sesudahnya ('' di akhir).
+// Kembalikan 0 (bukan closer sama sekali), 1/2 (closer biasa), 3/4
+// (tidak bisa menutup — terserap ke hitungan opener), 5/6 (closer
+// kondisional — rule of 3s / cek karakter sebelumnya).
+function closerKind(ch, prev, next) {
   if (ch === '~') {
-    // '~' uses the non-GFM classes: '~' IS punct/punctSpace, NOT
+    // '~' memakai kelas non-GFM: '~' ADALAH punct/punctSpace, BUKAN
     // notPunctSpace.
-    if (isPunct(prev) && (next === '' || /\s/.test(next))) return 1;
-    if (isPlainWord(prev) && (next === '' || isPlainPunctSpace(next))) return 2;
-    if (isPlainPunctSpace(prev) && isPlainWord(next)) return 3;
-    if (prev !== '' && /\s/.test(prev) && isPunct(next)) return 4;
-    if (isPunct(prev) && isPunct(next)) return 5;
-    if (isPlainWord(prev) && isPlainWord(next)) return 6;
+    if (isPunctCh(prev) && (next === '' || /\s/.test(next))) return 1;
+    if (isPlainWordCh(prev) && (next === '' || isPlainPunctSpaceCh(next))) return 2;
+    if (isPlainPunctSpaceCh(prev) && isPlainWordCh(next)) return 3;
+    if (prev !== '' && /\s/.test(prev) && isPunctCh(next)) return 4;
+    if (isPunctCh(prev) && isPunctCh(next)) return 5;
+    if (isPlainWordCh(prev) && isPlainWordCh(next)) return 6;
     return 0;
   }
   if (ch === '_') {
-    // '_' uses the non-GFM classes too. Note: no group 6 for '_'
-    // (intraword '_' cannot close).
-    if (isPunct(prev) && (next === '' || /\s/.test(next))) return 1;
-    if (isPlainWord(prev) && (next === '' || isPlainPunctSpace(next))) return 2;
-    if (isPlainPunctSpace(prev) && isPlainWord(next)) return 3;
-    if (prev !== '' && /\s/.test(prev) && isPunct(next)) return 4;
-    if (isPunct(prev) && isPunct(next)) return 5;
+    // '_' juga memakai kelas non-GFM. Catatan: tidak ada grup 6 untuk
+    // '_' ('_' intraword tidak bisa menutup).
+    if (isPunctCh(prev) && (next === '' || /\s/.test(next))) return 1;
+    if (isPlainWordCh(prev) && (next === '' || isPlainPunctSpaceCh(next))) return 2;
+    if (isPlainPunctSpaceCh(prev) && isPlainWordCh(next)) return 3;
+    if (prev !== '' && /\s/.test(prev) && isPunctCh(next)) return 4;
+    if (isPunctCh(prev) && isPunctCh(next)) return 5;
     return 0;
   }
-  // '*' uses the GFM classes: '~' is NOT punct/punctSpace, IS
+  // '*' memakai kelas GFM: '~' BUKAN punct/punctSpace, TAPI
   // notPunctSpace.
-  if (isGfmPunct(prev) && (next === '' || /\s/.test(next))) return 1;
-  if (isGfmWord(prev) && (next === '' || isGfmPunctSpace(next))) return 2;
-  if (isGfmPunctSpace(prev) && isGfmWord(next)) return 3;
-  if (prev !== '' && /\s/.test(prev) && isGfmPunct(next)) return 4;
-  if (isGfmPunct(prev) && isGfmPunct(next)) return 5;
-  if (isGfmWord(prev) && isGfmWord(next)) return 6;
+  if (isGfmPunctCh(prev) && (next === '' || /\s/.test(next))) return 1;
+  if (isGfmWordCh(prev) && (next === '' || isGfmPunctSpaceCh(next))) return 2;
+  if (isGfmPunctSpaceCh(prev) && isGfmWordCh(next)) return 3;
+  if (prev !== '' && /\s/.test(prev) && isGfmPunctCh(next)) return 4;
+  if (isGfmPunctCh(prev) && isGfmPunctCh(next)) return 5;
+  if (isGfmWordCh(prev) && isGfmWordCh(next)) return 6;
   return 0;
 }
 
-// The "skip" alternative of the closer rules: when scanning for a closer
-// for `ch`, a span `__...*...__` (for '*') or `**..._...**` (for '_') is
-// skipped wholesale. Returns the index to resume scanning at, or -1.
-function skipEmphasisSpan(masked, from, ch) {
+// Alternatif "skip" dari aturan closer: saat mencari closer untuk `ch`,
+// rentang `__...*...__` (untuk '*') atau `**..._...**` (untuk '_')
+// dilewati utuh. Kembalikan indeks untuk lanjut memindai, atau -1.
+function skipEmphasis(masked, from, ch) {
   const open = ch === '*' ? '__' : '**';
   const inner = ch === '*' ? '*' : '_';
   const n = masked.length;
-  // The first `open` must be the first delimiter in the text (no * or _
-  // before it).
+  // `open` pertama harus delimiter pertama di teks (tidak ada * atau _
+  // sebelumnya).
   let first = -1;
   for (let i = from; i < n; i++) {
     const c = masked[i];
@@ -491,23 +495,24 @@ function skipEmphasisSpan(masked, from, ch) {
   return third;
 }
 
-// ================================================================ 3. inline engine
+// ================================================================ D. mesin inline
 
-// Find a valid GFM email starting at or after `from` (the position to
-// start looking for '@'); returns its start index, or -1.
-const EMAIL_LOCAL_RE = /[A-Za-z0-9._+-]/;
-const EMAIL_DOMAIN_RE = /^[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
+// Cari email GFM yang valid mulai pada atau setelah `from` (posisi
+// mulai mencari '@'); kembalikan indeks awalnya, atau -1.
+const EMAIL_LOCAL_CH = /[A-Za-z0-9._+-]/;
+const EMAIL_DOMAIN = /^[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
 
-// Email local-part char, by char code (faster than a regex test).
-function isEmailLocalCode(code) {
+// Karakter local-part email, lewat kode karakter (lebih cepat dari tes
+// regex).
+function emailLocalCode(code) {
   return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) ||
     code === 46 || code === 95 || code === 43 || code === 45;
 }
 
-// End of the current text chunk (marked's GFM text rule, implemented as
-// a scan instead of the lazy regex). `i` is the chunk start. A single
-// pass replaces ~15 indexOf scans.
-function textChunkEnd(src, i) {
+// Akhir chunk teks saat ini (aturan text GFM marked, diimplementasi
+// sebagai pemindaian, bukan regex lazy). `i` adalah awal chunk. Satu
+// pass menggantikan ~15 pemindaian indexOf.
+function chunkEnd(src, i) {
   const n = src.length;
   let firstEnd = i + 1;
   if (src[i] === '`' || src[i] === '~') {
@@ -518,7 +523,7 @@ function textChunkEnd(src, i) {
     switch (code) {
       case 92: case 60: case 33: case 91: case 96: case 42: case 126: case 95: // \ < ! [ ` * ~ _
         return p;
-      case 119: // w — www. (needs a boundary before it)
+      case 119: // w — www. (perlu batas sebelumnya)
         if (src.startsWith('www.', p)) {
           const prev = p === 0 ? '' : src[p - 1];
           if (prev === '' || /\s/.test(prev) || prev === '*' || prev === '_' || prev === '~' || prev === '(') return p;
@@ -553,11 +558,11 @@ function textChunkEnd(src, i) {
       case 64: // @ — email
         {
           let start = p;
-          while (start > 0 && isEmailLocalCode(src.charCodeAt(start - 1))) start--;
-          if (start < p && EMAIL_DOMAIN_RE.test(src.slice(p + 1))) return start <= i ? firstEnd : start;
+          while (start > 0 && emailLocalCode(src.charCodeAt(start - 1))) start--;
+          if (start < p && EMAIL_DOMAIN.test(src.slice(p + 1))) return start <= i ? firstEnd : start;
         }
         break;
-      case 10: // \n — hard break: 2+ spaces before it
+      case 10: // \n — hard break: 2+ spasi sebelumnya
         {
           let q = p - 1;
           let spaces = 0;
@@ -570,89 +575,91 @@ function textChunkEnd(src, i) {
   return n;
 }
 
-// The inline tokenizer/renderer. One instance serves a whole document:
-// `links` is the document's reference-definition table and `st` is the
-// shared inline state — marked's lexer keeps ONE state across all inline
-// parses, resetting only `inRawBlock` before each block's inline tokens,
-// while `inLink` persists across blocks (an unclosed `<a ...>` tag
-// disables GFM url/email linkification for the rest of the document).
-class InlineEngine {
+// Tokenizer/renderer inline. Satu instance melayani satu dokumen:
+// `links` adalah tabel definisi referensi dokumen dan `st` adalah
+// state inline bersama — lexer marked menyimpan SATU state untuk semua
+// parse inline, hanya me-reset `inRawBlock` sebelum token inline tiap
+// blok, sementara `inLink` bertahan antar blok (tag `<a ...>` yang
+// tidak tertutup mematikan linkifikasi url/email GFM untuk sisa
+// dokumen).
+class Inline {
   constructor(links, st) {
     this.links = links;
     this.st = st || { inLink: false, linkEmitted: false, inRawBlock: false };
   }
 
-  // Parse inline markdown into HTML (or plain text when textMode is
-  // true — the label text of an image, or a heading's text content).
+  // Parse markdown inline jadi HTML (atau teks polos bila textMode
+  // true — teks label sebuah image, atau isi teks sebuah heading).
   render(src, textMode = false) {
     const n = src.length;
     if (n === 0) return '';
     const links = this.links;
     const st = this.st;
     const hasDelim = src.includes('*') || src.includes('_') || src.includes('~');
-    const masked = hasDelim ? maskDelimiters(src, links) : src;
+    const masked = hasDelim ? maskDelims(src, links) : src;
     const parenPossible = src.includes(')');
     let out = '';
     let i = 0;
-    let prevLast = ''; // previous token's last char (for emStrong/del)
+    let prevLast = ''; // karakter terakhir token sebelumnya (untuk emStrong/del)
     let wasText = false;
     while (i < n) {
       if (!wasText) prevLast = '';
       wasText = false;
       const ch = src[i];
-      // 1. Escape — in textMode the char is returned raw (marked's text
-      // renderer renders an escape token via its text() method).
-      if (ch === '\\' && i + 1 < n && ASCII_PUNCT.has(src[i + 1])) {
-        out += textMode ? src[i + 1] : escapeHtml(src[i + 1]);
+      // 1. Escape — dalam textMode karakternya dikembalikan mentah
+      // (renderer text marked merender token escape lewat method
+      // text()-nya).
+      if (ch === '\\' && i + 1 < n && ASCII_PUNCT_SET.has(src[i + 1])) {
+        out += textMode ? src[i + 1] : escHtml(src[i + 1]);
         i += 2;
         continue;
       }
-      // 2. Raw HTML tag.
+      // 2. Tag HTML mentah.
       if (ch === '<') {
-        const m = TAG_RE.exec(src.slice(i));
+        const m = HTML_TAG.exec(src.slice(i));
         if (m) {
           const tag = m[0];
-          if (!st.inLink && OPEN_A_RE.test(tag)) st.inLink = true;
-          else if (st.inLink && CLOSE_A_RE.test(tag)) st.inLink = false;
-          if (!st.inRawBlock && OPEN_PRE_RE.test(tag)) st.inRawBlock = true;
-          else if (st.inRawBlock && CLOSE_PRE_RE.test(tag)) st.inRawBlock = false;
+          if (!st.inLink && OPEN_ANCHOR.test(tag)) st.inLink = true;
+          else if (st.inLink && CLOSE_ANCHOR.test(tag)) st.inLink = false;
+          if (!st.inRawBlock && OPEN_RAW_TAG.test(tag)) st.inRawBlock = true;
+          else if (st.inRawBlock && CLOSE_RAW_TAG.test(tag)) st.inRawBlock = false;
           out += tag;
           i += tag.length;
           continue;
         }
       }
-      // 3. Inline link / image.
+      // 3. Link / image inline.
       if (parenPossible && (ch === '[' || (ch === '!' && src[i + 1] === '['))) {
-        const lk = this.readInlineLink(src, i);
+        const lk = this.scanInlineLink(src, i);
         if (lk) {
-          const made = this.buildLink(lk.label, lk.href, lk.title, lk.isImage, lk.end, textMode);
+          const made = this.makeLink(lk.label, lk.href, lk.title, lk.isImage, lk.end, textMode);
           if (made) {
             out += made.html;
             i = made.end;
             continue;
           }
-          // Link dropped (a nested link inside) — fall through to text.
+          // Link dibuang (ada link bersarang di dalam) — jatuh ke teks.
         }
       }
-      // 4. Reference link / image.
+      // 4. Link / image referensi.
       if (ch === '[' || (ch === '!' && src[i + 1] === '[')) {
-        const rl = this.readReferenceLink(src, i);
+        const rl = this.scanRefLink(src, i);
         if (rl) {
-          if (labelTagOverruns(src, (rl.isImage ? i + 1 : i) + 1, rl.label.length)) {
-            // A tag crossing the label — not a link; fall through to text.
+          if (tagSpillsFromLabel(src, (rl.isImage ? i + 1 : i) + 1, rl.label.length)) {
+            // Tag melintasi label — bukan link; jatuh ke teks.
           } else {
-            const def = links[normalizeLabel(rl.ref || rl.label)];
+            const def = links[foldLabel(rl.ref || rl.label)];
             if (def) {
-              const made = this.buildLink(rl.label, def.href, def.title, rl.isImage, rl.end, textMode);
+              const made = this.makeLink(rl.label, def.href, def.title, rl.isImage, rl.end, textMode);
               if (made) {
                 out += made.html;
                 i = made.end;
                 continue;
               }
             } else {
-              // Unresolved: only the first char becomes text.
+              // Tidak ter-resolve: hanya karakter pertama jadi teks.
               const first = src[i];
-              out += textMode ? escapeHtml(first) : escapeHtml(decodeNumericRefs(first));
+              out += textMode ? escHtml(first) : escHtml(decodeNumRefs(first));
               i += 1;
               if (first !== '_') prevLast = first;
               wasText = true;
@@ -663,7 +670,7 @@ class InlineEngine {
       }
       // 5. Emphasis / strong.
       if (ch === '*' || ch === '_') {
-        const em = this.tryEmphasis(src, masked, i, prevLast, textMode);
+        const em = this.tryEm(src, masked, i, prevLast, textMode);
         if (em) {
           out += em.html;
           i = em.end;
@@ -672,16 +679,16 @@ class InlineEngine {
       }
       // 6. Code span.
       if (ch === '`') {
-        const m = CODE_SPAN_RE.exec(src.slice(i));
+        const m = CODE_SPAN.exec(src.slice(i));
         if (m) {
           let span = m[2].replace(/\n/g, ' ');
           if (/[^ ]/.test(span) && /^ /.test(span) && / $/.test(span)) span = span.substring(1, span.length - 1);
-          out += textMode ? span : '<code>' + escapeHtml(span, true) + '</code>';
+          out += textMode ? span : '<code>' + escHtml(span, true) + '</code>';
           i += m[0].length;
           continue;
         }
       }
-      // 7. Hard break (two spaces + newline, or backslash + newline).
+      // 7. Hard break (dua spasi + newline, atau backslash + newline).
       if (ch === ' ' || ch === '\\') {
         let j = i;
         if (ch === ' ') {
@@ -709,7 +716,7 @@ class InlineEngine {
       }
       // 8. Strikethrough.
       if (ch === '~') {
-        const d = this.tryDel(src, masked, i, prevLast, textMode);
+        const d = this.tryStrike(src, masked, i, prevLast, textMode);
         if (d) {
           out += d.html;
           i = d.end;
@@ -718,23 +725,23 @@ class InlineEngine {
       }
       // 9. Autolink <...>.
       if (ch === '<') {
-        const m = AUTOLINK_RE.exec(src.slice(i));
+        const m = AUTOLINK.exec(src.slice(i));
         if (m) {
           const isEmail = m[2] === '@';
           const text = m[1];
           const href = isEmail ? 'mailto:' + text : text;
-          const clean = cleanUrl(href);
+          const clean = tidyHref(href);
           if (clean !== null) {
             if (textMode) out += text;
-            else out += '<a href="' + escapeHtml(clean, true) + '">' + escapeHtml(text, true) + '</a>';
+            else out += '<a href="' + escHtml(clean, true) + '">' + escHtml(text, true) + '</a>';
             i += m[0].length;
             continue;
           }
         }
       }
-      // 10. GFM extended URL / email (not inside a link).
+      // 10. URL / email GFM tambahan (tidak di dalam link).
       if (!st.inLink) {
-        const m = EXT_URL_RE.exec(src.slice(i));
+        const m = EXTENDED_URL.exec(src.slice(i));
         if (m) {
           let text;
           let href;
@@ -746,30 +753,30 @@ class InlineEngine {
             let prev;
             do {
               prev = raw;
-              const bp = BACKPEDAL_RE.exec(raw);
+              const bp = BACKPEDAL.exec(raw);
               raw = bp ? bp[0] : '';
             } while (raw !== prev);
             text = raw;
             href = m[1] === 'www.' ? 'http://' + raw : raw;
           }
-          const clean = cleanUrl(href);
+          const clean = tidyHref(href);
           if (clean !== null) {
             if (textMode) out += text;
-            else out += '<a href="' + escapeHtml(clean, true) + '">' + escapeHtml(text, true) + '</a>';
+            else out += '<a href="' + escHtml(clean, true) + '">' + escHtml(text, true) + '</a>';
             i += text.length;
             continue;
           }
         }
       }
-      // 11. Text. In textMode the chunk is decoded but NOT escaped —
-      // marked's text renderer returns the token text as-is; the caller
-      // escapes it when placing it in an attribute.
-      const end = textChunkEnd(src, i);
+      // 11. Teks. Dalam textMode chunk di-decode tapi TIDAK di-escape —
+      // renderer text marked mengembalikan teks token apa adanya;
+      // pemanggil meng-escape saat menaruhnya di atribut.
+      const end = chunkEnd(src, i);
       const chunk = src.slice(i, end);
       if (textMode) {
-        out += st.inRawBlock ? chunk : decodeNumericRefs(chunk);
+        out += st.inRawBlock ? chunk : decodeNumRefs(chunk);
       } else {
-        out += st.inRawBlock ? chunk : escapeHtml(decodeNumericRefs(chunk));
+        out += st.inRawBlock ? chunk : escHtml(decodeNumRefs(chunk));
       }
       if (chunk.slice(-1) !== '_') prevLast = chunk.slice(-1);
       wasText = true;
@@ -778,52 +785,53 @@ class InlineEngine {
     return out;
   }
 
-  // Try emphasis/strong at src[i] (src[i] is '*' or '_'). `masked` is
-  // the masked container string, `prevChar` the previous token's last
-  // char. Returns {html, end} (end = index just past the em/strong) or
-  // null.
-  tryEmphasis(src, masked, i, prevChar, textMode) {
+  // Coba emphasis/strong di src[i] (src[i] adalah '*' atau '_').
+  // `masked` adalah string kontainer hasil mask, `prevChar` karakter
+  // terakhir token sebelumnya. Kembalikan {html, end} (end = indeks
+  // tepat setelah em/strong) atau null.
+  tryEm(src, masked, i, prevChar, textMode) {
     const ch = src[i];
-    // Opener run, then a punct char or a non-space char must follow.
+    // Run opener, lalu harus diikuti karakter punct atau karakter
+    // bukan spasi.
     let j = i;
     while (j < src.length && src[j] === ch) j++;
     const runHere = j - i;
     if (j >= src.length) return null;
     const after = src[j];
     if (after === ' ' || after === '\t' || after === '\n') return null;
-    const followedByPunct = isGfmPunct(after);
-    // The run may extend before i (a previous token ended with the same
-    // char).
+    const followedByPunct = isGfmPunctCh(after);
+    // Run bisa memanjang ke sebelum i (token sebelumnya berakhir dengan
+    // karakter yang sama).
     let runStart = i;
     while (runStart > 0 && masked[runStart - 1] === ch) runStart--;
-    const charBeforeRun = runStart > 0 ? codePointBefore(masked, runStart) : '';
-    const beforeIsPunctOrDelim = charBeforeRun === '*' || charBeforeRun === '_' || isOpenerPunct(charBeforeRun);
+    const charBeforeRun = runStart > 0 ? cpBefore(masked, runStart) : '';
+    const beforeIsPunctOrDelim = charBeforeRun === '*' || charBeforeRun === '_' || isOpenerPunctCh(charBeforeRun);
     const charBeforeToken = runStart < i ? charBeforeRun : prevChar;
-    const beforeIsOpenerPunct = runStart < i ? beforeIsPunctOrDelim : isOpenerPunct(charBeforeToken);
-    if (ch === '_' && !followedByPunct && isAlnum(charBeforeToken)) return null; // intraword _
+    const beforeIsOpenerPunct = runStart < i ? beforeIsPunctOrDelim : isOpenerPunctCh(charBeforeToken);
+    if (ch === '_' && !followedByPunct && isAlnumCh(charBeforeToken)) return null; // _ intraword
     const punctAfter = followedByPunct ? after : '';
-    if (punctAfter && charBeforeToken !== '' && !beforeIsOpenerPunct) return null; // cannot open (not left-flanking)
+    if (punctAfter && charBeforeToken !== '' && !beforeIsOpenerPunct) return null; // tidak bisa membuka (bukan left-flanking)
     const fullRun = i - runStart + runHere;
     const ruleOfThreesApplies = charBeforeRun.trim() !== '' &&
       (punctAfter !== '' || (ch === '*' && !beforeIsPunctOrDelim));
     const prevIsSameDelim = prevChar === ch;
-    // Scan for a closer in the masked string, starting after the opener.
+    // Pindai closer di string hasil mask, mulai setelah opener.
     let pos = i + runHere;
-    const skipTo = skipEmphasisSpan(masked, pos, ch);
+    const skipTo = skipEmphasis(masked, pos, ch);
     if (skipTo >= 0) pos = skipTo;
     let remaining = runHere;
     let absorbed = 0;
     while (pos < masked.length) {
-      // Find the next run of ch.
+      // Cari run `ch` berikutnya.
       let q = pos;
       while (q < masked.length && masked[q] !== ch) q++;
       if (q >= masked.length) break;
       let r = q;
       while (r < masked.length && masked[r] === ch) r++;
       const closerLen = r - q;
-      const prev = codePointBefore(masked, q);
-      const next = codePointAfter(masked, r);
-      const group = classifyCloser(ch, prev, next);
+      const prev = cpBefore(masked, q);
+      const next = cpAfter(masked, r);
+      const group = closerKind(ch, prev, next);
       if (group === 0) { pos = r; continue; }
       if (group === 3 || group === 4) { remaining += closerLen; pos = r; continue; }
       if (group === 5 || group === 6 || ruleOfThreesApplies) {
@@ -851,18 +859,18 @@ class InlineEngine {
     return null;
   }
 
-  // Try strikethrough at src[i] (src[i] is '~'). Returns {html, end}
-  // or null.
-  tryDel(src, masked, i, prevChar, textMode) {
+  // Coba strikethrough di src[i] (src[i] adalah '~'). Kembalikan
+  // {html, end} atau null.
+  tryStrike(src, masked, i, prevChar, textMode) {
     let j = i;
     while (j < src.length && src[j] === '~' && j - i < 2) j++;
-    const openerLen = j - i; // opener length (1 or 2)
+    const openerLen = j - i; // panjang opener (1 atau 2)
     if (openerLen === 0) return null;
     if (j >= src.length) return null;
     const after = src[j];
     if (after === ' ' || after === '\t' || after === '\n' || after === '~') return null;
-    const followedByPunct = isGfmPunct(after);
-    if (followedByPunct && prevChar !== '' && !isOpenerPunct(prevChar)) return null;
+    const followedByPunct = isGfmPunctCh(after);
+    if (followedByPunct && prevChar !== '' && !isOpenerPunctCh(prevChar)) return null;
     let remaining = openerLen;
     let pos = i + openerLen;
     while (pos < masked.length) {
@@ -872,10 +880,10 @@ class InlineEngine {
       let r = q;
       while (r < masked.length && masked[r] === '~') r++;
       const closerLen = r - q;
-      if (closerLen !== openerLen) { pos = r; continue; } // closer must be exactly the opener length
-      const prev = codePointBefore(masked, q);
-      const next = codePointAfter(masked, r);
-      const group = classifyCloser('~', prev, next);
+      if (closerLen !== openerLen) { pos = r; continue; } // closer harus sama persis panjangnya dengan opener
+      const prev = cpBefore(masked, q);
+      const next = cpAfter(masked, r);
+      const group = closerKind('~', prev, next);
       if (group === 0) { pos = r; continue; }
       if (group === 3 || group === 4) { remaining += closerLen; pos = r; continue; }
       remaining -= closerLen;
@@ -892,14 +900,15 @@ class InlineEngine {
     return null;
   }
 
-  // Scan an inline link/image at src[i]: [label](dest "title") or
-  // ![label](...). Returns {isImage, label, href, title, end} or null.
-  readInlineLink(src, i) {
+  // Pindai link/image inline di src[i]: [label](dest "title") atau
+  // ![label](...). Kembalikan {isImage, label, href, title, end}
+  // atau null.
+  scanInlineLink(src, i) {
     const isImage = src[i] === '!';
     const labelStart = isImage ? i + 1 : i;
-    const lab = readLabel(src, labelStart);
+    const lab = scanLabel(src, labelStart);
     if (!lab) return null;
-    if (labelTagOverruns(src, labelStart + 1, lab.label.length)) return null;
+    if (tagSpillsFromLabel(src, labelStart + 1, lab.label.length)) return null;
     let j = lab.end;
     if (src[j] !== '(') return null;
     j++;
@@ -940,19 +949,19 @@ class InlineEngine {
     let title = null;
     let rawEnd = -1;
     if (!angle) {
-      const unbalanced = parenBalance(href, '()');
+      const unbalanced = parenCheck(href, '()');
       if (unbalanced === -2) return null;
       if (unbalanced > -1) {
-        // Truncate the href at the unmatched ')'; the title is dropped
-        // and the raw match ends right after that ')'.
+        // Potong href di ')' yang tidak berpasangan; title dibuang dan
+        // kecocokan mentah berakhir tepat setelah ')' itu.
         href = href.substring(0, unbalanced);
         rawEnd = destStart + unbalanced + 1;
         title = '';
       }
     }
     if (rawEnd < 0) {
-      // Optional title, after a separator of spaces/tabs (with an
-      // optional newline) or a newline.
+      // Title opsional, setelah pemisah spasi/tab (dengan newline
+      // opsional) atau newline.
       let k = j;
       let sep = false;
       if (src[k] === ' ' || src[k] === '\t') {
@@ -968,12 +977,12 @@ class InlineEngine {
         while (k < src.length && (src[k] === ' ' || src[k] === '\t')) k++;
       }
       if (sep) {
-        const found = this.readLinkTitle(src, k);
+        const found = this.scanTitle(src, k);
         if (found) { title = found.title; k = found.end; }
       }
       while (k < src.length && (src[k] === ' ' || src[k] === '\t' || src[k] === '\n')) k++;
       if (src[k] !== ')') return null;
-      // The closing ')' must not be escaped.
+      // ')' penutup tidak boleh di-escape.
       let backslashes = 0;
       for (let q = k - 1; q >= 0 && src[q] === '\\'; q--) backslashes++;
       if (backslashes % 2 === 1) return null;
@@ -982,15 +991,15 @@ class InlineEngine {
     return {
       isImage,
       label: lab.label.replace(/\\([\[\]])/g, '$1'),
-      href: unescapePunct(href.trim()),
-      title: title === null ? null : unescapePunct(title),
+      href: unescPunct(href.trim()),
+      title: title === null ? null : unescPunct(title),
       end: rawEnd,
     };
   }
 
-  // Scan a link title at src[i]: "..." | '...' | (...).
-  // Returns {title, end} or null.
-  readLinkTitle(src, i) {
+  // Pindai title link di src[i]: "..." | '...' | (...).
+  // Kembalikan {title, end} atau null.
+  scanTitle(src, i) {
     const quote = src[i];
     if (quote === '"' || quote === "'") {
       let j = i + 1;
@@ -1015,18 +1024,18 @@ class InlineEngine {
     return null;
   }
 
-  // Scan a reference link at src[i]: [label][ref] | [label][] | [ref] |
-  // [ref][]. Returns {isImage, label, ref, end} or null. `ref` is ''
-  // for the collapsed form (meaning "use the label").
-  readReferenceLink(src, i) {
+  // Pindai link referensi di src[i]: [label][ref] | [label][] | [ref] |
+  // [ref][]. Kembalikan {isImage, label, ref, end} atau null. `ref`
+  // adalah '' untuk bentuk collapsed (artinya "pakai label").
+  scanRefLink(src, i) {
     const isImage = src[i] === '!';
     const labelStart = isImage ? i + 1 : i;
     if (src[labelStart] !== '[') return null;
-    const lab = readLabel(src, labelStart);
+    const lab = scanLabel(src, labelStart);
     if (!lab) return null;
     const afterLabel = lab.end;
     if (src[afterLabel] === '[') {
-      // [label][ref] or [label][]
+      // [label][ref] atau [label][]
       let j = afterLabel + 1;
       if (src[j] === ']') return { isImage, label: lab.label, ref: '', end: j + 1 };
       let k = j;
@@ -1041,7 +1050,7 @@ class InlineEngine {
       if (/^\s*\]/.test(ref) || ref.trim() === '') return null;
       return { isImage, label: lab.label, ref, end: k + 1 };
     }
-    // Shortcut form: [ref] or [ref][]
+    // Bentuk shortcut: [ref] atau [ref][]
     if (lab.label.length === 0) return null;
     if (/^\s/.test(lab.label) && lab.label.trim() === '') return null;
     let end = afterLabel;
@@ -1049,11 +1058,11 @@ class InlineEngine {
     return { isImage, label: lab.label, ref: lab.label, end };
   }
 
-  // Build a link/image from a parsed label + destination (marked's
-  // link renderer). Returns {html, end} or null (when a nested link was
-  // emitted inside the label, the outer link is dropped). `rawEnd` is
-  // the index just past the whole link in the source.
-  buildLink(label, href, title, isImage, rawEnd, textMode) {
+  // Bangun link/image dari label + destinasi yang sudah diparse
+  // (renderer link marked). Kembalikan {html, end} atau null (bila ada
+  // link bersarang yang ter-emit di dalam label, link luar dibuang).
+  // `rawEnd` adalah indeks tepat setelah keseluruhan link di sumber.
+  makeLink(label, href, title, isImage, rawEnd, textMode) {
     const st = this.st;
     const labelText = label.replace(/\\([\[\]])/g, '$1');
     const savedInLink = st.inLink;
@@ -1061,9 +1070,9 @@ class InlineEngine {
     const savedRaw = st.inRawBlock;
     st.inLink = true;
     st.linkEmitted = false;
-    // An image's label is always rendered as plain text (the alt text) —
-    // even when the image itself is in HTML mode. A link's label follows
-    // the caller's mode.
+    // Label image selalu dirender sebagai teks polos (alt text) —
+    // bahkan saat image-nya sendiri dalam mode HTML. Label link
+    // mengikuti mode pemanggil.
     const inner = this.render(labelText, isImage ? true : textMode);
     const nested = st.linkEmitted;
     st.linkEmitted = savedEmitted;
@@ -1076,33 +1085,33 @@ class InlineEngine {
       st.linkEmitted = true;
     }
     if (textMode) {
-      // In text mode a link/image renders as its label text.
+      // Dalam mode teks, link/image dirender sebagai teks labelnya.
       return { html: inner, end: rawEnd };
     }
     if (isImage) {
-      const clean = cleanUrl(href);
-      if (clean === null) return { html: escapeHtml(inner), end: rawEnd };
-      let out = `<img src="${escapeHtml(clean)}" alt="${escapeHtml(inner)}"`;
-      if (title) out += ` title="${escapeHtml(title)}"`;
+      const clean = tidyHref(href);
+      if (clean === null) return { html: escHtml(inner), end: rawEnd };
+      let out = `<img src="${escHtml(clean)}" alt="${escHtml(inner)}"`;
+      if (title) out += ` title="${escHtml(title)}"`;
       return { html: out + '>', end: rawEnd };
     }
-    const clean = cleanUrl(href);
+    const clean = tidyHref(href);
     if (clean === null) return { html: inner, end: rawEnd };
-    let out = `<a href="${escapeHtml(clean)}"`;
-    if (title) out += ` title="${escapeHtml(title)}"`;
+    let out = `<a href="${escHtml(clean)}"`;
+    if (title) out += ` title="${escHtml(title)}"`;
     return { html: out + '>' + inner + '</a>', end: rawEnd };
   }
 }
 
-// ================================================================ 4. block line classifiers
-// Line-based block parsing. The source is split into lines (without the
-// '\n'); `starts[i]` is the byte offset of line i, `starts[lines.length]`
-// is the source length, so raw(a, b) = src.slice(starts[a], starts[b]).
+// ================================================================ E. pengenal baris blok
+// Parsing blok berbasis baris. Sumber dipecah jadi baris (tanpa '\n');
+// `starts[i]` adalah offset byte baris i, `starts[lines.length]`
+// adalah panjang sumber, jadi raw(a, b) = src.slice(starts[a], starts[b]).
 
-const BLOCK_TAGS = new Set('address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul'.split('|'));
-const RAW_BLOCK_TAGS = new Set(['pre', 'script', 'style', 'textarea']);
+const BLOCK_TAG_NAMES = new Set('address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul'.split('|'));
+const RAW_TAG_NAMES = new Set(['pre', 'script', 'style', 'textarea']);
 
-function splitLines(src) {
+function splitSourceLines(src) {
   if (src === '') return { lines: [], starts: [0] };
   const lines = src.split('\n');
   const starts = [0];
@@ -1110,13 +1119,13 @@ function splitLines(src) {
   return { lines, starts };
 }
 
-function isBlankLine(line) {
+function isBlank(line) {
   return /^[ \t]*$/.test(line);
 }
 
-// The line with up to 3 leading spaces/tabs stripped (returns the rest
-// and how many columns were stripped). Tabs count by column.
-function stripLead3(line) {
+// Baris dengan maksimal 3 spasi/tab di depan yang dihapus (kembalikan
+// sisanya dan berapa kolom yang terhapus). Tab dihitung per kolom.
+function stripLead(line) {
   let col = 0;
   let i = 0;
   while (i < line.length && col < 3) {
@@ -1131,36 +1140,37 @@ function stripLead3(line) {
   return { rest: line.slice(i), col };
 }
 
-const HR_RUN_RE = /^(?:-[\t ]*){3,}$|^(?:_[\t ]*){3,}$|^(?:\*[\t ]*){3,}$/;
-function isHorizontalRule(line) {
-  const { rest } = stripLead3(line);
-  // Do NOT trim the leading whitespace: a tab at the start is 4 columns,
-  // so `\t***` is NOT an hr (marked allows only 0-3 spaces). HR_RUN_RE
-  // already allows trailing spaces/tabs.
-  return HR_RUN_RE.test(rest) && /^(?:-|\*|_)/.test(rest);
+const HR_RUN = /^(?:-[\t ]*){3,}$|^(?:_[\t ]*){3,}$|^(?:\*[\t ]*){3,}$/;
+function isHr(line) {
+  const { rest } = stripLead(line);
+  // Jangan trim whitespace depan: tab di awal adalah 4 kolom, jadi
+  // `\t***` BUKAN hr (marked hanya mengizinkan 0-3 spasi). HR_RUN
+  // sudah mengizinkan spasi/tab di ujung.
+  return HR_RUN.test(rest) && /^(?:-|\*|_)/.test(rest);
 }
 
-function atxDepth(line) {
-  const { rest } = stripLead3(line);
+function atxLevel(line) {
+  const { rest } = stripLead(line);
   const m = /^(#{1,6})(?:\s|$)/.exec(rest);
   return m ? m[1].length : 0;
 }
 
-function fenceInfo(line) {
-  const { rest } = stripLead3(line);
+function fenceHead(line) {
+  const { rest } = stripLead(line);
   const m = /^(`{3,}(?=[^`\n]*$)|~{3,})/.exec(rest);
   return m ? { ch: m[0][0], len: m[0].length, info: rest.slice(m[0].length) } : null;
 }
 
-function isQuoteLine(line) {
+function isQuote(line) {
   return /^ {0,3}>/.test(line);
 }
 
-// A list marker at the start of a line (after <= 3 spaces). `anyOrdered`
-// allows any start number (for the lazy-line / setext checks); otherwise
-// only a bullet or "1." / "1)" interrupts a paragraph.
-function readListMarker(line, anyOrdered) {
-  const { rest } = stripLead3(line);
+// Marker list di awal baris (setelah <= 3 spasi). `anyOrdered`
+// mengizinkan nomor awal berapa pun (untuk cek lazy-line / setext);
+// bila tidak, hanya bullet atau "1." / "1)" yang menginterupsi
+// paragraf.
+function scanMarker(line, anyOrdered) {
+  const { rest } = stripLead(line);
   let m = /^([*+-])(?=[ \t]|$)/.exec(rest);
   if (m) return { marker: m[1], ordered: false, start: 0, rest: rest.slice(1) };
   m = anyOrdered
@@ -1170,20 +1180,20 @@ function readListMarker(line, anyOrdered) {
   return null;
 }
 
-// Does the list marker on this line interrupt a paragraph? Marked's
-// paragraph rule requires `[ \t]+[^ \t\n]` after the marker — an empty
-// item (`*` or `1.` alone, or with only trailing whitespace) does NOT
-// interrupt, so the line stays paragraph text.
-function markerBreaksParagraph(line) {
-  const marker = readListMarker(line, false);
+// Apakah marker list pada baris ini menginterupsi paragraf? Aturan
+// paragraf marked mensyaratkan `[ \t]+[^ \t\n]` setelah marker — item
+// kosong (`*` atau `1.` saja, atau hanya diikuti whitespace) TIDAK
+// menginterupsi, jadi baris itu tetap teks paragraf.
+function markerBreaksPara(line) {
+  const marker = scanMarker(line, false);
   if (!marker) return false;
   return /^[ \t]+[^ \t]/.test(marker.rest);
 }
 
-// HTML block start (types 1-6 only — type 7 cannot interrupt a
-// paragraph). Returns the type number or 0.
-function htmlBlockKind(line) {
-  const { rest } = stripLead3(line);
+// Awal blok HTML (hanya tipe 1-6 — tipe 7 tidak bisa menginterupsi
+// paragraf). Kembalikan nomor tipe, atau 0.
+function htmlKind(line) {
+  const { rest } = stripLead(line);
   if (!rest.startsWith('<')) return 0;
   const m1 = /^<(script|pre|style|textarea)(?:[\s>]|$)/i.exec(rest);
   if (m1) return 1;
@@ -1192,135 +1202,136 @@ function htmlBlockKind(line) {
   if (/^<![A-Za-z]/.test(rest)) return 4;
   if (rest.startsWith('<![CDATA[')) return 5;
   const m6 = /^<\/?([A-Za-z][A-Za-z0-9-]*)(?:[ \t]+|\n|\/?>|$)/.exec(rest);
-  if (m6 && BLOCK_TAGS.has(m6[1].toLowerCase())) return 6;
+  if (m6 && BLOCK_TAG_NAMES.has(m6[1].toLowerCase())) return 6;
   return 0;
 }
 
-// Type 7: any complete tag on one line, only whitespace after it.
-function isHtmlTypeSeven(line) {
-  const { rest } = stripLead3(line);
+// Tipe 7: tag lengkap apa pun dalam satu baris, hanya whitespace
+// setelahnya.
+function isHtml7(line) {
+  const { rest } = stripLead(line);
   if (!rest.startsWith('<')) return false;
-  const m = TAG_RE.exec(rest);
+  const m = HTML_TAG.exec(rest);
   if (!m) return false;
   const after = rest.slice(m[0].length);
   return /^[ \t]*$/.test(after);
 }
 
-// A table delimiter line (for the header/delimiter check).
-function isDelimiterRow(line) {
-  const { rest } = stripLead3(line);
+// Baris delimiter tabel (untuk cek header/delimiter).
+function isDelimRow(line) {
+  const { rest } = stripLead(line);
   return /^(?:\| *)?:?-+:? *(?:\| *:?-+:? *)*(?:\| *)?$/.test(rest) && /[:|]/.test(rest);
 }
 
-// Does lines[i] (header) + lines[i+1] (delimiter) start a table?
-function beginsTable(lines, i) {
+// Apakah lines[i] (header) + lines[i+1] (delimiter) memulai tabel?
+function tableBegins(lines, i) {
   if (i + 1 >= lines.length) return false;
   const header = lines[i];
   if (header.trim() === '') return false;
   if (!/^\S/.test(header.replace(/^ */, ''))) return false;
   const delim = lines[i + 1];
-  if (!isDelimiterRow(delim)) return false;
-  const headerCells = splitTableRow(header);
+  if (!isDelimRow(delim)) return false;
+  const headerCells = splitRowCells(header);
   const delimCells = delim.replace(/^\||\| *$/g, '').split('|');
   return headerCells.length === delimCells.length;
 }
 
-// Paragraph continuation check (GFM paragraph rule, line-based).
-function paragraphContinues(lines, i) {
+// Cek kelanjutan paragraf (aturan paragraf GFM, berbasis baris).
+function paraContinues(lines, i) {
   const line = lines[i];
-  if (isBlankLine(line)) {
-    // A trailing whitespace-only line with no '\n' after it (last line,
-    // non-empty) is part of the paragraph: marked's paragraph pattern
-    // excludes only `[ \t]+\n` (whitespace + newline), so the lookahead
-    // fails at end of input and the line is included.
+  if (isBlank(line)) {
+    // Baris whitespace-only di ujung tanpa '\n' setelahnya (baris
+    // terakhir, tidak kosong) adalah bagian paragraf: pola paragraf
+    // marked mengecualikan hanya `[ \t]+\n` (whitespace + newline),
+    // jadi lookahead gagal di akhir input dan baris itu ikut.
     return i === lines.length - 1 && line !== '';
   }
   if (/^[ \t]+\n?$/.test(line) && line.trim() === '') return false;
-  if (isHorizontalRule(line)) return false;
-  if (atxDepth(line)) return false;
-  if (isQuoteLine(line)) return false;
-  if (fenceInfo(line)) return false;
-  if (markerBreaksParagraph(line)) return false;
-  if (htmlBlockKind(line)) return false;
-  if (beginsTable(lines, i)) return false;
+  if (isHr(line)) return false;
+  if (atxLevel(line)) return false;
+  if (isQuote(line)) return false;
+  if (fenceHead(line)) return false;
+  if (markerBreaksPara(line)) return false;
+  if (htmlKind(line)) return false;
+  if (tableBegins(lines, i)) return false;
   return true;
 }
 
-// Setext text continuation (the setext-heading text rule): like a
-// paragraph, but a bullet of any kind stops it, and a
-// table-delimiter-like line stops it.
-function setextTextContinues(lines, i) {
+// Kelanjutan teks setext (aturan teks setext-heading): seperti
+// paragraf, tapi bullet jenis apa pun menghentikannya, dan baris yang
+// mirip delimiter tabel menghentikannya.
+function setextContinues(lines, i) {
   const line = lines[i];
-  if (isBlankLine(line)) return false;
-  if (readListMarker(line, true)) return false;
-  if (fenceInfo(line)) return false;
-  if (isQuoteLine(line)) return false;
-  if (atxDepth(line)) return false;
-  if (isHorizontalRule(line)) return false;
+  if (isBlank(line)) return false;
+  if (scanMarker(line, true)) return false;
+  if (fenceHead(line)) return false;
+  if (isQuote(line)) return false;
+  if (atxLevel(line)) return false;
+  if (isHr(line)) return false;
   if (/^ {0,3}<[^\n>]+>$/.test(line)) return false;
   if (/^ {0,3}\|?(?:[:\- ]*\|)+[:\- ]*$/.test(line)) return false;
   return true;
 }
 
-function setextDepth(line) {
-  const { rest } = stripLead3(line);
+function setextLevel(line) {
+  const { rest } = stripLead(line);
   const m = /^((?:=+|-+))[ \t]*$/.exec(rest);
   return m ? (m[1][0] === '=' ? 1 : 2) : 0;
 }
 
-// Scan a link reference definition at the start of `src` (from `pos`).
-// Returns {label, href, title, rawLen} or null. `rawLen` is the number
-// of source characters consumed (including trailing newlines).
-const DEF_RE = /^ {0,3}\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\\n]|\n(?![ \t]*\n))+)\]: *(?:\n[ \t]*)?([^<\s][^\s]*|<.*?>)(?:(?: +(?:\n[ \t]*)?| *\n[ \t]*)((?:"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\\n]|\n(?!\n))*'|\((?:\\[\s\S]|[^()\\])*\))))? *(?:\n+|$)/;
-function readDefinitionAt(src, pos) {
-  const m = DEF_RE.exec(src.slice(pos));
+// Pindai definisi referensi link di awal `src` (dari `pos`).
+// Kembalikan {label, href, title, rawLen} atau null. `rawLen` adalah
+// jumlah karakter sumber yang terpakai (termasuk newline di ujung).
+const DEF_PATTERN = /^ {0,3}\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\\n]|\n(?![ \t]*\n))+)\]: *(?:\n[ \t]*)?([^<\s][^\s]*|<.*?>)(?:(?: +(?:\n[ \t]*)?| *\n[ \t]*)((?:"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\\n]|\n(?!\n))*'|\((?:\\[\s\S]|[^()\\])*\))))? *(?:\n+|$)/;
+function scanDefinition(src, pos) {
+  const m = DEF_PATTERN.exec(src.slice(pos));
   if (!m) return null;
   const dest = m[2];
-  if (!dest.startsWith('<') && parenBalance(dest, '()') !== -1) return null;
+  if (!dest.startsWith('<') && parenCheck(dest, '()') !== -1) return null;
   const href = dest.startsWith('<')
-    ? dest.slice(1, -1).replace(ESCAPED_PUNCT_RE, '$1')
-    : dest.replace(ESCAPED_PUNCT_RE, '$1');
-  const title = m[3] ? m[3].substring(1, m[3].length - 1).replace(ESCAPED_PUNCT_RE, '$1') : null;
+    ? dest.slice(1, -1).replace(ESCAPED_PUNCT, '$1')
+    : dest.replace(ESCAPED_PUNCT, '$1');
+  const title = m[3] ? m[3].substring(1, m[3].length - 1).replace(ESCAPED_PUNCT, '$1') : null;
   return { label: m[1], href, title, rawLen: m[0].length };
 }
 
-// Fence-closing and HTML-close regexes, cached per key instead of
-// rebuilding one for every line scanned.
-const REGEX_CACHE = new Map();
-function closingFenceRegex(ch, len) {
+// Regex penutup fence dan penutup HTML, di-cache per kunci agar tidak
+// dibuat ulang untuk tiap baris yang dipindai.
+const RE_CACHE = new Map();
+function fenceClosePattern(ch, len) {
   const key = ch + len;
-  let rx = REGEX_CACHE.get(key);
+  let rx = RE_CACHE.get(key);
   if (!rx) {
     rx = new RegExp('^(' + (ch === '`' ? '`' : '~') + '{' + len + ',})[ \\t]*$');
-    REGEX_CACHE.set(key, rx);
+    RE_CACHE.set(key, rx);
   }
   return rx;
 }
-function htmlCloseRegex(tag) {
+function htmlClosePattern(tag) {
   const key = 'html/' + tag;
-  let rx = REGEX_CACHE.get(key);
+  let rx = RE_CACHE.get(key);
   if (!rx) {
     rx = new RegExp('</' + tag + '>', 'i');
-    REGEX_CACHE.set(key, rx);
+    RE_CACHE.set(key, rx);
   }
   return rx;
 }
 
-// ================================================================ 5. block parser
+// ================================================================ F. lexer blok
 // ctx: {links, defs, top, mergePara, hadBlankBetween}
-//   links: label -> {href, title} (first definition wins)
-//   defs:  [{raw}] in document order (for the marked fallback)
-//   top:   true at the top level / inside blockquotes, false inside list
-//          items
-//   mergePara: true when parsing blockquote inner content (only the
-//          FIRST paragraph of this call may merge into a previous
-//          paragraph)
-// `into` is an optional shared blocks array to append to (blockquote
-// groups accumulate into one array).
+//   links: label -> {href, title} (definisi pertama menang)
+//   defs:  [{raw}] dalam urutan dokumen (untuk fallback marked)
+//   top:   true di level atas / dalam blockquote, false di dalam item
+//          list
+//   mergePara: true saat mem-parse isi dalam blockquote (hanya paragraf
+//          PERTAMA dari panggilan ini yang boleh bergabung ke paragraf
+//          sebelumnya)
+// `into` adalah array blok bersama opsional untuk ditambahi (grup
+// blockquote menumpuk ke satu array).
 
-class BlockParser {
+class BlockLexer {
   constructor(src, ctx, into) {
-    const { lines, starts } = splitLines(src);
+    const { lines, starts } = splitSourceLines(src);
     this.src = src;
     this.ctx = ctx;
     this.links = ctx.links;
@@ -1330,18 +1341,18 @@ class BlockParser {
     this.n = lines.length;
     this.blocks = into || [];
     this.i = 0;
-    this.emitted = false; // any block appended by this call yet
-    this.lastEnd = 0;     // line index just after the last emitted block
-    this.sawBlank = false; // a blank line was skipped after a block
+    this.emitted = false; // ada blok yang ditambahkan panggilan ini
+    this.lastEnd = 0;     // indeks baris tepat setelah blok terakhir
+    this.sawBlank = false; // ada baris kosong yang dilewati setelah blok
   }
 
-  rawOf(a, b) {
+  sliceLines(a, b) {
     return this.src.slice(this.starts[a], this.starts[b]);
   }
-  prevBlock() {
+  lastBlock() {
     return this.blocks[this.blocks.length - 1];
   }
-  mark(endLine) {
+  noteBlock(endLine) {
     if (this.sawBlank && this.emitted) this.ctx.hadBlankBetween = true;
     this.sawBlank = false;
     this.emitted = true;
@@ -1351,29 +1362,29 @@ class BlockParser {
   parse() {
     while (this.i < this.n) {
       const line = this.lines[this.i];
-      if (isBlankLine(line)) { this.sawBlank = true; this.i++; continue; }
-      if (this.tryIndentedCode()) continue;
-      if (this.tryFencedCode()) continue;
-      if (this.tryAtxHeading()) continue;
-      if (this.tryHr()) continue;
-      if (this.tryBlockquote()) continue;
-      if (this.tryList()) continue;
-      if (this.tryHtmlBlock()) continue;
-      if (this.tryDefinition()) continue;
-      if (this.tryTable()) continue;
-      if (this.trySetextHeading()) continue;
-      this.readParagraphOrText();
+      if (isBlank(line)) { this.sawBlank = true; this.i++; continue; }
+      if (this.tryIndentCode()) continue;
+      if (this.tryFence()) continue;
+      if (this.tryAtx()) continue;
+      if (this.tryRule()) continue;
+      if (this.tryQuote()) continue;
+      if (this.tryListBlock()) continue;
+      if (this.tryHtml()) continue;
+      if (this.tryDef()) continue;
+      if (this.tryTableBlock()) continue;
+      if (this.trySetext()) continue;
+      this.readPara();
     }
-    // Marked's lexer keeps ONE shared `state.top` across all blockTokens
-    // calls and sets it back to true at the end of each call: after a
-    // nested list/blockquote is parsed, the following blocks in the
-    // enclosing context are parsed as paragraphs (top=true), not
-    // one-line text tokens.
+    // Lexer marked menyimpan SATU `state.top` bersama di semua
+    // pemanggilan blockTokens dan mengembalikannya ke true di akhir
+    // tiap pemanggilan: setelah list/blockquote bersarang di-parse,
+    // blok berikutnya di konteks pembungkus di-parse sebagai paragraf
+    // (top=true), bukan token teks satu baris.
     this.ctx.top = true;
     return this.blocks;
   }
 
-  tryIndentedCode() {
+  tryIndentCode() {
     const line = this.lines[this.i];
     if (!/^(?: {4}| {0,3}\t)/.test(line) || line.trim() === '') return false;
     const { lines, src } = this;
@@ -1382,25 +1393,25 @@ class BlockParser {
     let lastCode = this.i;
     while (j < n) {
       if (/^(?: {4}| {0,3}\t)/.test(lines[j]) && lines[j].trim() !== '') { lastCode = j; j++; continue; }
-      if (isBlankLine(lines[j])) {
+      if (isBlank(lines[j])) {
         let k = j + 1;
-        while (k < n && isBlankLine(lines[k])) k++;
+        while (k < n && isBlank(lines[k])) k++;
         if (k < n && /^(?: {4}| {0,3}\t)/.test(lines[k]) && lines[k].trim() !== '') { j = k; continue; }
         break;
       }
       break;
     }
-    // Marked's indented-code match includes the trailing blank lines
-    // after the code, so stripTrailingBlanks() strips them; without them
-    // the merged text keeps a trailing '\n'. Include them in rawText (i
-    // still advances only past the code lines, so the blanks are seen by
-    // the main loop).
+    // Kecocokan indented-code marked menyertakan baris kosong di
+    // ujung kode, jadi trimTrailingBlank() membuangnya; tanpanya teks
+    // gabungan menyimpan '\n' di ujung. Sertakan baris itu di rawText
+    // (i tetap maju hanya melewati baris kode, jadi baris kosong
+    // dilihat oleh loop utama).
     let rawEnd = lastCode + 1;
-    while (rawEnd < n && isBlankLine(lines[rawEnd])) rawEnd++;
-    const rawText = this.rawOf(this.i, rawEnd);
-    let text = stripTrailingBlanks(rawText);
+    while (rawEnd < n && isBlank(lines[rawEnd])) rawEnd++;
+    const rawText = this.sliceLines(this.i, rawEnd);
+    let text = trimTrailingBlank(rawText);
     text = text.replace(/^(?: {0,3}\t| {1,4})/gm, '');
-    const prev = this.prevBlock();
+    const prev = this.lastBlock();
     if (prev && (prev.type === 'paragraph' || prev.type === 'text') && this.i === this.lastEnd) {
       prev.text += '\n' + text;
       prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + rawText;
@@ -1409,202 +1420,204 @@ class BlockParser {
       return true;
     }
     this.blocks.push({ type: 'code', raw: rawText, text, lang: '', fenced: false });
-    this.mark(lastCode + 1);
+    this.noteBlock(lastCode + 1);
     this.i = lastCode + 1;
     return true;
   }
 
-  tryFencedCode() {
-    const fence = fenceInfo(this.lines[this.i]);
+  tryFence() {
+    const fence = fenceHead(this.lines[this.i]);
     if (!fence || (fence.ch === '`' && fence.info.includes('`'))) return false;
     const { lines, src } = this;
     const n = this.n;
     let j = this.i + 1;
     let closed = -1;
     while (j < n) {
-      const { rest: rest2 } = stripLead3(lines[j]);
-      const m = closingFenceRegex(fence.ch, fence.len).exec(rest2);
+      const { rest: rest2 } = stripLead(lines[j]);
+      const m = fenceClosePattern(fence.ch, fence.len).exec(rest2);
       if (m) { closed = j; break; }
       j++;
     }
     const contentEnd = closed >= 0 ? closed : n;
     let content = src.slice(this.starts[this.i + 1], this.starts[contentEnd]);
-    // Marked's fence match group 3 excludes the final newline before the
-    // closing fence (or EOF); the renderer re-adds exactly one.
+    // Grup 3 kecocokan fence marked mengecualikan newline terakhir
+    // sebelum fence penutup (atau EOF); renderer menambah tepat satu.
     if (content.endsWith('\n')) content = content.slice(0, -1);
-    content = dedentFence(this.rawOf(this.i, this.i + 1), content);
-    const info = fence.info.trim().replace(ESCAPED_PUNCT_RE, '$1');
+    content = dedentCode(this.sliceLines(this.i, this.i + 1), content);
+    const info = fence.info.trim().replace(ESCAPED_PUNCT, '$1');
     const lang = info.match(/^\S*/)?.[0] || '';
-    this.blocks.push({ type: 'code', raw: this.rawOf(this.i, closed >= 0 ? closed + 1 : n), text: content, lang, fenced: true });
+    this.blocks.push({ type: 'code', raw: this.sliceLines(this.i, closed >= 0 ? closed + 1 : n), text: content, lang, fenced: true });
     const next = contentEnd + (closed >= 0 ? 1 : 0);
-    this.mark(next);
+    this.noteBlock(next);
     this.i = next;
     return true;
   }
 
-  tryAtxHeading() {
+  tryAtx() {
     const line = this.lines[this.i];
-    const atx = atxDepth(line);
+    const atx = atxLevel(line);
     if (!atx) return false;
-    const { rest } = stripLead3(line);
+    const { rest } = stripLead(line);
     let text = rest.slice(atx);
     text = text.replace(/^[ \t]+/, '');
     const closing = /[ \t]+#+[ \t]*$/.exec(text) || /^(#+)[ \t]*$/.exec(text);
     if (closing) text = text.slice(0, text.length - closing[0].length);
     text = text.replace(/[ \t]+$/, '');
-    this.blocks.push({ type: 'heading', raw: this.rawOf(this.i, this.i + 1), depth: atx, text });
-    this.mark(this.i + 1);
+    this.blocks.push({ type: 'heading', raw: this.sliceLines(this.i, this.i + 1), depth: atx, text });
+    this.noteBlock(this.i + 1);
     this.i++;
     return true;
   }
 
-  tryHr() {
-    if (!isHorizontalRule(this.lines[this.i])) return false;
-    this.blocks.push({ type: 'hr', raw: this.rawOf(this.i, this.i + 1) });
-    this.mark(this.i + 1);
+  tryRule() {
+    if (!isHr(this.lines[this.i])) return false;
+    this.blocks.push({ type: 'hr', raw: this.sliceLines(this.i, this.i + 1) });
+    this.noteBlock(this.i + 1);
     this.i++;
     return true;
   }
 
-  tryBlockquote() {
-    if (!isQuoteLine(this.lines[this.i])) return false;
-    const bq = this.readBlockquoteAt(this.src, this.starts[this.i]);
+  tryQuote() {
+    if (!isQuote(this.lines[this.i])) return false;
+    const bq = this.scanQuote(this.src, this.starts[this.i]);
     if (!bq) return false;
     this.blocks.push(bq.block);
     const consumed = this.src.slice(this.starts[this.i], this.starts[this.i] + bq.rawLen);
     let next = this.i + consumed.split('\n').length;
     if (consumed.endsWith('\n')) next--;
-    this.mark(next);
+    this.noteBlock(next);
     this.i = next;
     return true;
   }
 
-  tryList() {
-    // Any ordered start can begin a list at a block boundary; only `1`
-    // interrupts a paragraph, handled inside paragraphContinues.
-    const marker = readListMarker(this.lines[this.i], true);
+  tryListBlock() {
+    // Nomor awal berapa pun bisa memulai list di batas blok; hanya `1`
+    // yang menginterupsi paragraf, ditangani di dalam paraContinues.
+    const marker = scanMarker(this.lines[this.i], true);
     if (!marker || !(marker.rest === '' || /^[ \t]/.test(marker.rest))) return false;
-    const lst = this.readListAt(this.src, this.starts[this.i]);
+    const lst = this.scanList(this.src, this.starts[this.i]);
     if (!lst) return false;
     this.blocks.push(lst.block);
     const consumed = this.src.slice(this.starts[this.i], this.starts[this.i] + lst.rawLen);
     let next = this.i + consumed.split('\n').length;
     if (consumed.endsWith('\n')) next--;
-    this.mark(next);
+    this.noteBlock(next);
     this.i = next;
     return true;
   }
 
-  tryHtmlBlock() {
+  tryHtml() {
     const line = this.lines[this.i];
-    const htmlKind = htmlBlockKind(line) || (isHtmlTypeSeven(line) ? 7 : 0);
-    if (!htmlKind) return false;
-    const hb = this.readHtmlBlock(this.i, htmlKind);
+    const kind = htmlKind(line) || (isHtml7(line) ? 7 : 0);
+    if (!kind) return false;
+    const hb = this.scanHtml(this.i, kind);
     this.blocks.push({ type: 'html', raw: hb.raw, text: hb.text, pre: hb.pre });
-    this.mark(hb.next);
+    this.noteBlock(hb.next);
     this.i = hb.next;
     return true;
   }
 
-  tryDefinition() {
-    const def = readDefinitionAt(this.src, this.starts[this.i]);
+  tryDef() {
+    const def = scanDefinition(this.src, this.starts[this.i]);
     if (!def) return false;
     const defRaw = this.src.slice(this.starts[this.i], this.starts[this.i] + def.rawLen);
-    // Lines spanned: newlines + 1, unless the raw ends with a newline
-    // (then the last split element is empty and adds no line).
+    // Baris yang tercakup: newline + 1, kecuali raw berakhir newline
+    // (maka elemen split terakhir kosong dan tidak menambah baris).
     const consumed = defRaw.endsWith('\n')
       ? defRaw.split('\n').length - 1
       : defRaw.split('\n').length;
-    const prev = this.prevBlock();
+    const prev = this.lastBlock();
     if (prev && (prev.type === 'paragraph' || prev.type === 'text') && this.i === this.lastEnd) {
-      // Merged into the previous paragraph/text: NOT registered as a link.
+      // Bergabung ke paragraf/teks sebelumnya: TIDAK didaftarkan
+      // sebagai link.
       prev.text += '\n' + defRaw;
       prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + defRaw;
       this.lastEnd = this.i + Math.max(1, consumed);
       this.i = this.lastEnd;
       return true;
     }
-    const key = normalizeLabel(def.label);
+    const key = foldLabel(def.label);
     if (!Object.hasOwn(this.links, key)) {
       this.links[key] = { href: def.href, title: def.title };
       this.defs.push({ raw: defRaw });
     }
-    // A registered definition is a token of its own (renders as
-    // nothing); pushing it keeps the next definition from merging into a
-    // paragraph.
+    // Definisi yang terdaftar adalah token tersendiri (dirender jadi
+    // kosong); mendorongnya menjaga definisi berikutnya tidak bergabung
+    // ke paragraf.
     this.blocks.push({ type: 'def', raw: defRaw });
-    this.mark(this.i + Math.max(1, consumed));
+    this.noteBlock(this.i + Math.max(1, consumed));
     this.i = this.i + Math.max(1, consumed);
     return true;
   }
 
-  tryTable() {
-    if (!beginsTable(this.lines, this.i)) return false;
-    const tb = this.readTable(this.i);
+  tryTableBlock() {
+    if (!tableBegins(this.lines, this.i)) return false;
+    const tb = this.scanTableRows(this.i);
     this.blocks.push(tb.block);
-    this.mark(tb.next);
+    this.noteBlock(tb.next);
     this.i = tb.next;
     return true;
   }
 
-  trySetextHeading() {
+  trySetext() {
     const { lines } = this;
     const n = this.n;
     let j = this.i;
-    while (j < n && setextTextContinues(lines, j) && !setextDepth(lines[j])) j++;
-    if (j > this.i && j < n && setextDepth(lines[j])) {
-      const depth = setextDepth(lines[j]);
+    while (j < n && setextContinues(lines, j) && !setextLevel(lines[j])) j++;
+    if (j > this.i && j < n && setextLevel(lines[j])) {
+      const depth = setextLevel(lines[j]);
       const text = lines.slice(this.i, j).join('\n').trim();
-      this.blocks.push({ type: 'heading', raw: this.rawOf(this.i, j + 1), depth, text });
-      this.mark(j + 1);
+      this.blocks.push({ type: 'heading', raw: this.sliceLines(this.i, j + 1), depth, text });
+      this.noteBlock(j + 1);
       this.i = j + 1;
       return true;
     }
     return false;
   }
 
-  // Paragraph (top level / blockquote) or text (inside list items).
-  readParagraphOrText() {
+  // Paragraf (level atas / blockquote) atau teks (di dalam item list).
+  readPara() {
     const { lines } = this;
     const n = this.n;
     if (this.ctx.top) {
       let j = this.i;
-      while (j + 1 < n && paragraphContinues(lines, j + 1)) j++;
+      while (j + 1 < n && paraContinues(lines, j + 1)) j++;
       const text = lines.slice(this.i, j + 1).join('\n');
-      const prev = this.prevBlock();
+      const prev = this.lastBlock();
       if (this.ctx.mergePara && !this.emitted && prev && prev.type === 'paragraph') {
         prev.text += '\n' + text;
-        prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + this.rawOf(this.i, j + 1);
+        prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + this.sliceLines(this.i, j + 1);
       } else {
-        this.blocks.push({ type: 'paragraph', raw: this.rawOf(this.i, j + 1), text });
+        this.blocks.push({ type: 'paragraph', raw: this.sliceLines(this.i, j + 1), text });
       }
-      this.mark(j + 1);
+      this.noteBlock(j + 1);
       this.i = j + 1;
     } else {
       const text = lines[this.i];
-      const prev = this.prevBlock();
+      const prev = this.lastBlock();
       if (prev && prev.type === 'text' && this.i === this.lastEnd) {
         prev.text += '\n' + text;
-        prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + this.rawOf(this.i, this.i + 1);
+        prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + this.sliceLines(this.i, this.i + 1);
       } else {
-        this.blocks.push({ type: 'text', raw: this.rawOf(this.i, this.i + 1), text });
+        this.blocks.push({ type: 'text', raw: this.sliceLines(this.i, this.i + 1), text });
       }
-      this.mark(this.i + 1);
+      this.noteBlock(this.i + 1);
       this.i++;
     }
   }
 
-  // Parse an HTML block starting at lines[i] (type 1-7). Returns
-  // {raw, text, pre, next}. `text` is the stripTrailingBlanks()'d raw.
-  readHtmlBlock(i, type) {
+  // Parse blok HTML mulai dari lines[i] (tipe 1-7). Kembalikan
+  // {raw, text, pre, next}. `text` adalah raw yang sudah
+  // trimTrailingBlank().
+  scanHtml(i, type) {
     const { lines, starts, src } = this;
     const n = lines.length;
-    let end = i + 1; // index past the last line of the block
+    let end = i + 1; // indeks setelah baris terakhir blok
     const first = lines[i];
-    const { rest } = stripLead3(first);
+    const { rest } = stripLead(first);
     if (type === 1) {
       const tag = /^<(script|pre|style|textarea)/i.exec(rest)[1].toLowerCase();
-      const closeRe = htmlCloseRegex(tag);
+      const closeRe = htmlClosePattern(tag);
       let j = i;
       let found = false;
       while (j < n) {
@@ -1649,32 +1662,33 @@ class BlockParser {
       }
       end = j + 1 <= n ? j + 1 : n;
     } else {
-      // Types 6 and 7: until a blank line.
+      // Tipe 6 dan 7: sampai baris kosong.
       let j = i + 1;
-      while (j < n && !isBlankLine(lines[j])) j++;
+      while (j < n && !isBlank(lines[j])) j++;
       end = j;
     }
-    // stripTrailingBlanks() runs on the matched text. Marked's html
-    // pattern ends types 1-5 with `(\n+|$)` — it swallows following
-    // truly EMPTY lines (just "\n") but stops at a whitespace-only line
-    // (e.g. "\t"). Types 6-7 end with `(?:(?:\n[ \t]*)+\n|$)` — they
-    // swallow whitespace-only lines too. Swallowing the blank lines is
-    // what makes stripTrailingBlanks() strip the block's own trailing
-    // newline; a whitespace-only line after a type 1-5 block leaves
-    // exactly one trailing newline.
+    // trimTrailingBlank() berjalan pada teks yang cocok. Pola html
+    // marked mengakhiri tipe 1-5 dengan `(\n+|$)` — ia menelan baris
+    // yang benar-benar KOSONG (hanya "\n") sesudahnya tapi berhenti di
+    // baris whitespace-only (mis. "\t"). Tipe 6-7 berakhir dengan
+    // `(?:(?:\n[ \t]*)+\n|$)` — mereka menelan baris whitespace-only
+    // juga. Menelan baris kosong itulah yang membuat
+    // trimTrailingBlank() membuang newline ujung blok itu sendiri;
+    // baris whitespace-only setelah blok tipe 1-5 menyisakan tepat
+    // satu newline di ujung.
     let rawEnd = end;
     if (type >= 6) {
-      while (rawEnd < n && isBlankLine(lines[rawEnd])) rawEnd++;
+      while (rawEnd < n && isBlank(lines[rawEnd])) rawEnd++;
     } else {
       while (rawEnd < n && lines[rawEnd] === '') rawEnd++;
     }
-    const rawText = stripTrailingBlanks(this.rawOf(i, rawEnd));
-    // Marked's html token raw IS the stripTrailingBlanks()'d text: the
-    // block consumes only that, NOT the swallowed blank lines after it.
-    // Those blanks stay and become a space token (which is what makes a
-    // list loose when a blank sits between an html block and the next
-    // block in an item). So `next` is the first line at or after the end
-    // of the stripTrailingBlanks()'d text.
+    const rawText = trimTrailingBlank(this.sliceLines(i, rawEnd));
+    // Raw token html marked ADALAH teks hasil trimTrailingBlank():
+    // blok hanya mengonsumsi itu, BUKAN baris kosong yang tertelan
+    // setelahnya. Baris kosong itu tetap ada dan menjadi token space
+    // (yang membuat list jadi loose saat ada blank antara blok html dan
+    // blok berikutnya di dalam item). Jadi `next` adalah baris pertama
+    // pada atau setelah akhir teks hasil trimTrailingBlank().
     const rawEndByte = starts[i] + rawText.length;
     let next = i + 1;
     while (next <= n && starts[next] < rawEndByte) next++;
@@ -1682,12 +1696,12 @@ class BlockParser {
     return { raw: rawText, text: rawText, pre, next: Math.min(next, n) };
   }
 
-  // Parse a table starting at lines[i] (header) with lines[i+1] the
+  // Parse tabel mulai dari lines[i] (header) dengan lines[i+1] sebagai
   // delimiter.
-  readTable(i) {
+  scanTableRows(i) {
     const { lines } = this;
     const n = lines.length;
-    const headerCells = splitTableRow(lines[i]);
+    const headerCells = splitRowCells(lines[i]);
     const delimCells = lines[i + 1].replace(/^\||\| *$/g, '').split('|');
     const align = delimCells.map((cell) => {
       if (/^ *-+: *$/.test(cell)) return 'right';
@@ -1700,28 +1714,29 @@ class BlockParser {
     let j = i + 2;
     while (j < n) {
       const line = lines[j];
-      // Marked's table pattern ends a row run on ` *\n` (spaces only): a
-      // line holding just a tab is a (blank) table row, not a blank line.
+      // Pola tabel marked mengakhiri rangkaian baris pada ` *\n`
+      // (spasi saja): baris yang hanya berisi tab adalah baris tabel
+      // (kosong), bukan baris kosong.
       if (/^ *$/.test(line)) break;
-      if (isHorizontalRule(line)) break;
-      if (atxDepth(line)) break;
-      if (isQuoteLine(line)) break;
+      if (isHr(line)) break;
+      if (atxLevel(line)) break;
+      if (isQuote(line)) break;
       if (/^(?: {4}| {0,3}\t)[^\n]/.test(line) && line.trim() !== '') break;
-      if (fenceInfo(line)) break;
-      if (readListMarker(line, false)) break;
-      if (htmlBlockKind(line)) break;
-      rows.push(splitTableRow(line, header.length).map((text, idx) => ({ text, align: align[idx] || null })));
+      if (fenceHead(line)) break;
+      if (scanMarker(line, false)) break;
+      if (htmlKind(line)) break;
+      rows.push(splitRowCells(line, header.length).map((text, idx) => ({ text, align: align[idx] || null })));
       j++;
     }
-    return { block: { type: 'table', raw: this.rawOf(i, j), header, rows }, next: j };
+    return { block: { type: 'table', raw: this.sliceLines(i, j), header, rows }, next: j };
   }
 
   // ============================================================ list & blockquote
-  // Parse a list starting at `pos` in `src`. Returns {block, rawLen}
-  // or null.
-  readListAt(src, pos) {
+  // Parse list mulai dari `pos` di `src`. Kembalikan {block, rawLen}
+  // atau null.
+  scanList(src, pos) {
     const source = src.slice(pos);
-    const firstMatch = LIST_OPEN_RE.exec(source);
+    const firstMatch = LIST_OPEN.exec(source);
     if (!firstMatch) return null;
     const full = source;
     let rest = source;
@@ -1730,42 +1745,42 @@ class BlockParser {
     const ordered = markerText.length > 1;
     const list = { type: 'list', raw: '', ordered, start: ordered ? +markerText.slice(0, -1) : '', loose: false, items: [] };
     markerText = ordered ? `\\d{1,9}\\${markerText.slice(-1)}` : `\\${markerText}`;
-    const itemRe = cachedItemLinePattern(markerText);
+    const itemRe = itemLinePatternCached(markerText);
     let pendingLoose = false;
     while (rest) {
       let emptyItem = false;
       let itemText = '';
       const itemMatch = itemRe.exec(rest);
-      if (!itemMatch || HR_WHOLE_RE.test(rest)) break;
+      if (!itemMatch || HR_WHOLE.test(rest)) break;
       const itemStart = consumed();
       rest = rest.substring(itemMatch[0].length);
       const firstLine = itemMatch[2].split('\n', 1)[0];
       const markerLen = itemMatch[1].length;
-      let firstContent = firstLine.replace(LEADING_WS_RE, (ws) => expandTabs(ws, markerLen));
+      let firstContent = firstLine.replace(LEADING_WS, (ws) => expandTabStops(ws, markerLen));
       let nextLine = rest.split('\n', 1)[0];
       let isEmpty = !firstContent.trim();
       let contentIndent = 0;
       if (isEmpty) contentIndent = markerLen + 1;
       else {
-        contentIndent = firstContent.search(NON_SPACE_RE);
+        contentIndent = firstContent.search(NON_SPACE);
         contentIndent = contentIndent > 4 ? 1 : contentIndent;
         itemText = firstContent.slice(contentIndent);
         contentIndent += markerLen;
       }
       if (isEmpty && /^[ \t]*$/.test(nextLine)) { rest = rest.substring(nextLine.length + 1); emptyItem = true; }
       if (!emptyItem) {
-        // Marked memoises these break patterns with a clamp to
-        // max(0, min(3, contentIndent-1)): a line indented more than
-        // that does NOT break the item, it is item content.
+        // Marked memoise pola break ini dengan clamp ke
+        // max(0, min(3, contentIndent-1)): baris yang indent-nya lebih
+        // dari itu TIDAK memutus item, melainkan isi item.
         const clamped = Math.max(0, Math.min(3, contentIndent - 1));
-        const { bullet, hr, fence, heading, html, quote } = breakSetFor(clamped);
+        const { bullet, hr, fence, heading, html, quote } = breakSet(clamped);
         while (rest) {
           const curLine = rest.split('\n', 1)[0];
           nextLine = curLine;
-          // Manual scan of the leading whitespace: index idx of the
-          // first non-space/tab char, its column col, and whether a tab
-          // occurs. This replaces the tab-expansion + 6 break-pattern
-          // tests for the common no-tab case.
+          // Pindai manual whitespace di depan: indeks idx karakter
+          // pertama bukan spasi/tab, kolomnya col, dan apakah ada tab.
+          // Ini menggantikan ekspansi tab + 6 tes pola break untuk
+          // kasus umum tanpa tab.
           let idx = 0;
           let col = 0;
           let hasTab = false;
@@ -1780,20 +1795,19 @@ class BlockParser {
           let blankLine;
           let expanded;
           if (firstCh === '\f' || firstCh === '\v') {
-            // Rare: leading form-feed/vertical-tab breaks the
-            // tab-expansion model; fall back to the regex-based
-            // computation.
-            expanded = nextLine.replace(LEADING_WS_RE, (ws) => expandTabs(ws));
-            colForCompare = expanded.search(NON_SPACE_RE);
+            // Jarang: form-feed/vertical-tab di depan merusak model
+            // ekspansi tab; kembali ke komputasi berbasis regex.
+            expanded = nextLine.replace(LEADING_WS, (ws) => expandTabStops(ws));
+            colForCompare = expanded.search(NON_SPACE);
             blankLine = !nextLine.trim();
           } else {
             blankLine = idx === nextLine.length;
-            expanded = hasTab ? nextLine.replace(LEADING_WS_RE, (ws) => expandTabs(ws)) : nextLine;
+            expanded = hasTab ? nextLine.replace(LEADING_WS, (ws) => expandTabStops(ws)) : nextLine;
             colForCompare = col;
           }
-          // The break patterns are ^ {0,clamped}(marker): they can only
-          // match when there is no leading tab, the leading-space count
-          // is <= clamped, and the first char can start a block.
+          // Pola break adalah ^ {0,clamped}(marker): pola itu hanya
+          // bisa cocok bila tidak ada tab di depan, jumlah spasi di
+          // depan <= clamped, dan karakter pertama bisa memulai blok.
           let isBreak = false;
           if (!hasTab && col <= clamped && firstCh !== '') {
             const code = firstCh.charCodeAt(0);
@@ -1806,9 +1820,9 @@ class BlockParser {
           if (isBreak) break;
           if (colForCompare >= contentIndent || blankLine) itemText += '\n' + expanded.slice(contentIndent);
           else {
-            if (isEmpty || firstContent.replace(/\t/g, '    ').search(NON_SPACE_RE) >= 4 ||
+            if (isEmpty || firstContent.replace(/\t/g, '    ').search(NON_SPACE) >= 4 ||
                 fence.test(firstContent) || heading.test(firstContent) || html.test(firstContent) || hr.test(firstContent)) break;
-            const setextLine = SETEXT_LINE_RE.test(nextLine) && canBeSetextText(firstContent)
+            const setextLine = SETEXT_LINE.test(nextLine) && setextTextOk(firstContent)
               ? '    ' + expanded.replace(/^ {0,3}/, '')
               : nextLine;
             itemText += '\n' + setextLine;
@@ -1821,9 +1835,9 @@ class BlockParser {
       const itemRaw = full.slice(itemStart, consumed());
       if (!list.loose) {
         if (pendingLoose) list.loose = true;
-        else if (DOUBLE_BLANK_RE.test(itemRaw)) pendingLoose = true;
+        else if (DOUBLE_BLANK.test(itemRaw)) pendingLoose = true;
       }
-      list.items.push({ type: 'list_item', raw: itemRaw, task: TASK_ITEM_RE.test(itemText), loose: false, text: itemText, tokens: [] });
+      list.items.push({ type: 'list_item', raw: itemRaw, task: TASK_ITEM.test(itemText), loose: false, text: itemText, tokens: [] });
     }
     const lastItem = list.items.at(-1);
     if (!lastItem) return null;
@@ -1832,16 +1846,16 @@ class BlockParser {
     list.raw = full.slice(0, consumed()).trimEnd();
     for (const item of list.items) {
       const itemCtx = { links: this.links, defs: this.defs, top: false, mergePara: false, hadBlankBetween: false };
-      item.tokens = new BlockParser(item.text, itemCtx).parse();
+      item.tokens = new BlockLexer(item.text, itemCtx).parse();
       if (!list.loose && itemCtx.hadBlankBetween) list.loose = true;
     }
     for (const item of list.items) {
       const firstToken = item.tokens[0];
       if (item.task && (firstToken?.type === 'text' || firstToken?.type === 'paragraph')) {
-        item.text = item.text.replace(TASK_PREFIX_RE, '');
-        firstToken.raw = firstToken.raw.replace(TASK_PREFIX_RE, '');
-        firstToken.text = firstToken.text.replace(TASK_PREFIX_RE, '');
-        const checkbox = TASK_CHECKBOX_RE.exec(item.raw);
+        item.text = item.text.replace(TASK_PREFIX, '');
+        firstToken.raw = firstToken.raw.replace(TASK_PREFIX, '');
+        firstToken.text = firstToken.text.replace(TASK_PREFIX, '');
+        const checkbox = TASK_BOX.exec(item.raw);
         if (checkbox) {
           item.checked = checkbox[0] !== '[ ]';
           item.hasCheckbox = true;
@@ -1854,30 +1868,31 @@ class BlockParser {
         for (const token of item.tokens) if (token.type === 'text') token.type = 'paragraph';
       }
     }
-    // The nested blockTokens calls set the shared state.top back to true.
+    // Pemanggilan blockTokens bersarang mengembalikan state.top bersama
+    // ke true.
     this.ctx.top = true;
     return { block: list, rawLen: list.raw.length };
   }
 
-  // Parse a blockquote starting at `pos` in `src`. Returns {block,
-  // rawLen} or null.
-  readBlockquoteAt(src, pos) {
+  // Parse blockquote mulai dari `pos` di `src`. Kembalikan {block,
+  // rawLen} atau null.
+  scanQuote(src, pos) {
     const source = src.slice(pos);
-    if (!QUOTE_START_RE.test(source)) return null;
-    const { lines } = splitLines(source);
+    if (!QUOTE_START.test(source)) return null;
+    const { lines } = splitSourceLines(source);
     const nLines = lines.length;
-    // Collect the blockquote run: a `>` line + its lazy continuations.
+    // Kumpulkan rangkaian blockquote: baris `>` + kelanjutan lazy-nya.
     let j = 0;
     while (j < nLines) {
-      if (!isQuoteLine(lines[j])) break;
+      if (!isQuote(lines[j])) break;
       const content = lines[j].replace(/^ {0,3}>[ \t]?/, '');
       j++;
       if (content !== '') {
         while (j < nLines) {
           const next = lines[j];
-          if (isBlankLine(next)) break;
-          if (isQuoteLine(next)) break;
-          if (isLazyLine(next)) j++; else break;
+          if (isBlank(next)) break;
+          if (isQuote(next)) break;
+          if (lazyLineOk(next)) j++; else break;
         }
       }
     }
@@ -1890,20 +1905,20 @@ class BlockParser {
       const groupLines = [];
       let lineIdx;
       for (lineIdx = 0; lineIdx < remaining.length; lineIdx++) {
-        if (QUOTE_START_RE.test(remaining[lineIdx])) { groupLines.push(remaining[lineIdx]); sawMarker = true; }
+        if (QUOTE_START.test(remaining[lineIdx])) { groupLines.push(remaining[lineIdx]); sawMarker = true; }
         else if (!sawMarker) groupLines.push(remaining[lineIdx]);
         else break;
       }
       remaining = remaining.slice(lineIdx);
       const groupText = groupLines.join('\n');
       const stripped = groupText
-        .replace(QUOTE_MARKER_WS_RE, (whole, marker, spaces) => marker + expandTabs(spaces, marker.length))
-        .replace(QUOTE_SETEXT_RE, '\n    $1')
-        .replace(QUOTE_STRIP_RE, '');
+        .replace(QUOTE_MARKER_WS, (whole, marker, spaces) => marker + expandTabStops(spaces, marker.length))
+        .replace(QUOTE_SETEXT, '\n    $1')
+        .replace(QUOTE_STRIP, '');
       rawAccum = rawAccum ? rawAccum + '\n' + groupText : groupText;
       textAccum = textAccum ? textAccum + '\n' + stripped : stripped;
       const innerCtx = { links: this.links, defs: this.defs, top: true, mergePara: true };
-      new BlockParser(stripped, innerCtx, tokens).parse();
+      new BlockLexer(stripped, innerCtx, tokens).parse();
       if (remaining.length === 0) break;
       const lastToken = tokens.at(-1);
       if (!lastToken) break;
@@ -1912,8 +1927,8 @@ class BlockParser {
       if (lastToken.type === 'blockquote') {
         const nested = lastToken;
         const restText = remaining.join('\n');
-        const reparsedSrc = nested.raw + '\n' + restText.replace(QUOTE_STRIP_RE, '');
-        const reparsed = this.readBlockquoteAt(reparsedSrc, 0);
+        const reparsedSrc = nested.raw + '\n' + restText.replace(QUOTE_STRIP, '');
+        const reparsed = this.scanQuote(reparsedSrc, 0);
         if (!reparsed) break;
         tokens[tokens.length - 1] = reparsed.block;
         const leftover = reparsedSrc.substring(reparsed.rawLen).replace(/^\n/, '');
@@ -1922,12 +1937,12 @@ class BlockParser {
         if (consumedGroup.length > 0) rawAccum = rawAccum + '\n' + consumedGroup.join('\n');
         textAccum = textAccum.substring(0, textAccum.length - nested.text.length) + reparsed.block.text;
         remaining = remaining.slice(consumedGroup.length);
-        if (remaining.length > 0 && QUOTE_START_RE.test(remaining[0])) continue;
+        if (remaining.length > 0 && QUOTE_START.test(remaining[0])) continue;
         break;
       } else if (lastToken.type === 'list') {
         const nestedList = lastToken;
         const reparsedSrc = nestedList.raw + '\n' + remaining.join('\n');
-        const reparsed = this.readListAt(reparsedSrc, 0);
+        const reparsed = this.scanList(reparsedSrc, 0);
         if (!reparsed) break;
         tokens[tokens.length - 1] = reparsed.block;
         const extraLines = reparsed.rawLen > nestedList.raw.length
@@ -1941,81 +1956,82 @@ class BlockParser {
         remaining = remaining.slice(extraLines);
         continue;
       }
-      // paragraph/text/def: continue with the next group
+      // paragraph/text/def: lanjut ke grup berikutnya
     }
-    // NB: marked's blockquote SAVES state.top before the inner
-    // blockTokens and RESTORES it after (unlike a list, which leaves it
-    // true), so the enclosing ctx.top is unchanged here.
+    // NB: blockquote marked MENYIMPAN state.top sebelum blockTokens
+    // dalam dan MEMULIHKANNYA setelahnya (berbeda dengan list, yang
+    // membiarkannya true), jadi ctx.top pembungkus tidak berubah di
+    // sini.
     return { block: { type: 'blockquote', raw: rawAccum, text: textAccum, tokens }, rawLen: rawAccum.length };
   }
 }
 
-// ================================================================ list & blockquote patterns
+// ================================================================ G. pola list & blockquote
 
-const HTML_BLOCK_TAGS_SRC = 'address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul';
-const LIST_OPEN_RE = /^( {0,3}(?:[*+-]|\d{1,9}[.)]))([ \t][^\n]*?)?(?:\n|$)/;
-const HR_WHOLE_RE = /^ {0,3}((?:-[\t ]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})(?:\n+|$)/;
-const DOUBLE_BLANK_RE = /\n[ \t]*\n[ \t]*$/;
-const TASK_ITEM_RE = /^\[[ xX]\][ \t]+\S/;
-const TASK_PREFIX_RE = /^\[[ xX]\][ \t]+/;
-const TASK_CHECKBOX_RE = /\[[ xX]\]/;
-const SETEXT_LINE_RE = /^ {0,3}(?:=+|-+) *$/;
-const NON_SPACE_RE = /[^ ]/;
-const LEADING_WS_RE = /^[ \t]+/;
-const QUOTE_START_RE = /^ {0,3}>/;
-const QUOTE_MARKER_WS_RE = /^( {0,3}>)([ \t]+)/gm;
-const QUOTE_SETEXT_RE = /\n {0,3}((?:=+|-+)[ \t]*)(?=\n|$)/g;
-const QUOTE_STRIP_RE = /^ {0,3}>[ \t]?/gm;
+const HTML_TAG_NAMES_SRC = 'address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul';
+const LIST_OPEN = /^( {0,3}(?:[*+-]|\d{1,9}[.)]))([ \t][^\n]*?)?(?:\n|$)/;
+const HR_WHOLE = /^ {0,3}((?:-[\t ]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})(?:\n+|$)/;
+const DOUBLE_BLANK = /\n[ \t]*\n[ \t]*$/;
+const TASK_ITEM = /^\[[ xX]\][ \t]+\S/;
+const TASK_PREFIX = /^\[[ xX]\][ \t]+/;
+const TASK_BOX = /\[[ xX]\]/;
+const SETEXT_LINE = /^ {0,3}(?:=+|-+) *$/;
+const NON_SPACE = /[^ ]/;
+const LEADING_WS = /^[ \t]+/;
+const QUOTE_START = /^ {0,3}>/;
+const QUOTE_MARKER_WS = /^( {0,3}>)([ \t]+)/gm;
+const QUOTE_SETEXT = /\n {0,3}((?:=+|-+)[ \t]*)(?=\n|$)/g;
+const QUOTE_STRIP = /^ {0,3}>[ \t]?/gm;
 
-function itemLinePattern(marker) {
+function itemLineRe(marker) {
   return new RegExp(`^( {0,3}${marker})((?:[\\t ][^\\n]*)?(?:\\n|$))`);
 }
-function nextMarkerPattern(indent) {
+function nextMarkerRe(indent) {
   return new RegExp(`^ {0,${indent}}(?:[*+-]|\\d{1,9}[.)])((?:[ \\t][^\\n]*)?(?:\\n|$))`);
 }
-function hrPatternFor(indent) {
+function hrReFor(indent) {
   return new RegExp(`^ {0,${indent}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$)`);
 }
-function fencePatternFor(indent) {
+function fenceReFor(indent) {
   return new RegExp(`^ {0,${indent}}(?:\`\`\`|~~~)`);
 }
-function headingPatternFor(indent) {
+function headingReFor(indent) {
   return new RegExp(`^ {0,${indent}}#{1,6}(?:\\s|$)`);
 }
-function htmlPatternFor(indent) {
-  return new RegExp(`^ {0,${indent}}(?:</?(?:${HTML_BLOCK_TAGS_SRC})(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`, 'i');
+function htmlReFor(indent) {
+  return new RegExp(`^ {0,${indent}}(?:</?(?:${HTML_TAG_NAMES_SRC})(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`, 'i');
 }
-function quotePatternFor(indent) {
+function quoteReFor(indent) {
   return new RegExp(`^ {0,${indent}}>`);
 }
 
-// Break patterns depend only on the clamped indent (0..3); cache them
-// instead of rebuilding (with `new RegExp`) for every list item.
-const BREAK_SET_CACHE = new Map();
-function breakSetFor(clamped) {
-  let hit = BREAK_SET_CACHE.get(clamped);
+// Pola break hanya bergantung pada indent hasil clamp (0..3); cache
+// supaya tidak dibuat ulang (dengan `new RegExp`) untuk tiap item list.
+const BREAK_CACHE = new Map();
+function breakSet(clamped) {
+  let hit = BREAK_CACHE.get(clamped);
   if (!hit) {
     hit = {
-      bullet: nextMarkerPattern(clamped),
-      hr: hrPatternFor(clamped),
-      fence: fencePatternFor(clamped),
-      heading: headingPatternFor(clamped),
-      html: htmlPatternFor(clamped),
-      quote: quotePatternFor(clamped),
+      bullet: nextMarkerRe(clamped),
+      hr: hrReFor(clamped),
+      fence: fenceReFor(clamped),
+      heading: headingReFor(clamped),
+      html: htmlReFor(clamped),
+      quote: quoteReFor(clamped),
     };
-    BREAK_SET_CACHE.set(clamped, hit);
+    BREAK_CACHE.set(clamped, hit);
   }
   return hit;
 }
-const ITEM_LINE_CACHE = new Map();
-function cachedItemLinePattern(marker) {
-  let hit = ITEM_LINE_CACHE.get(marker);
-  if (!hit) { hit = itemLinePattern(marker); ITEM_LINE_CACHE.set(marker, hit); }
+const ITEM_RE_CACHE = new Map();
+function itemLinePatternCached(marker) {
+  let hit = ITEM_RE_CACHE.get(marker);
+  if (!hit) { hit = itemLineRe(marker); ITEM_RE_CACHE.set(marker, hit); }
   return hit;
 }
 
-// Can `line` (a single line) be the text of a setext heading?
-function canBeSetextText(line) {
+// Bisakah `line` (satu baris) menjadi teks setext heading?
+function setextTextOk(line) {
   if (!line.trim()) return false;
   if (/^ {0,3}(?:[*+-]|\d{1,9}[.)]) /.test(line)) return false;
   if (/^(?: {4}| {0,3}\t)/.test(line)) return false;
@@ -2026,81 +2042,81 @@ function canBeSetextText(line) {
   return true;
 }
 
-// Is `line` a lazy paragraph continuation inside a blockquote?
-function isLazyLine(line) {
-  if (isBlankLine(line)) return false;
-  if (isHorizontalRule(line)) return false;
-  if (atxDepth(line)) return false;
-  if (isQuoteLine(line)) return false;
-  if (fenceInfo(line)) return false;
-  if (readListMarker(line, true)) return false;
-  if (htmlBlockKind(line)) return false;
+// Apakah `line` kelanjutan paragraf lazy di dalam blockquote?
+function lazyLineOk(line) {
+  if (isBlank(line)) return false;
+  if (isHr(line)) return false;
+  if (atxLevel(line)) return false;
+  if (isQuote(line)) return false;
+  if (fenceHead(line)) return false;
+  if (scanMarker(line, true)) return false;
+  if (htmlKind(line)) return false;
   return true;
 }
 
-// ================================================================ 6. renderer
-// `engine` is the document's InlineEngine: marked's lexer keeps ONE
-// inline state for the whole document, resetting only `inRawBlock`
-// before each block's inline tokens. Call `renderBlockInline` for a
-// block's own text.
+// ================================================================ H. renderer
+// `engine` adalah Inline milik dokumen: lexer marked menyimpan SATU
+// state inline untuk seluruh dokumen, hanya me-reset `inRawBlock`
+// sebelum token inline tiap blok. Panggil `inlineHtml` untuk teks
+// milik sebuah blok.
 
-function renderBlockInline(engine, text) {
+function inlineHtml(engine, text) {
   engine.st.inRawBlock = false;
   return engine.render(text, false);
 }
 
-function renderBlocks(blocks, engine) {
+function renderAllBlocks(blocks, engine) {
   let out = '';
-  for (const block of blocks) out += renderBlock(block, engine);
+  for (const block of blocks) out += renderOneBlock(block, engine);
   return out;
 }
 
-function renderBlock(block, engine) {
+function renderOneBlock(block, engine) {
   switch (block.type) {
     case 'space':
       return '';
     case 'code': {
       const firstWord = (block.lang || '').match(/^\S*/)?.[0] || '';
       const body = block.text ? block.text.replace(/\n$/, '') + '\n' : '';
-      const inner = escapeHtml(body, true);
+      const inner = escHtml(body, true);
       return firstWord
-        ? `<pre><code class="language-${escapeHtml(firstWord)}">${inner}</code></pre>\n`
+        ? `<pre><code class="language-${escHtml(firstWord)}">${inner}</code></pre>\n`
         : `<pre><code>${inner}</code></pre>\n`;
     }
     case 'blockquote':
-      return `<blockquote>\n${renderBlocks(block.tokens, engine)}</blockquote>\n`;
+      return `<blockquote>\n${renderAllBlocks(block.tokens, engine)}</blockquote>\n`;
     case 'html':
       return block.text;
     case 'def':
       return '';
     case 'heading':
-      return `<h${block.depth}>${renderBlockInline(engine, block.text)}</h${block.depth}>\n`;
+      return `<h${block.depth}>${inlineHtml(engine, block.text)}</h${block.depth}>\n`;
     case 'hr':
       return '<hr>\n';
     case 'list': {
       let itemsHtml = '';
-      for (const item of block.items) itemsHtml += renderItem(item, engine);
+      for (const item of block.items) itemsHtml += renderListItem(item, engine);
       const tag = block.ordered ? 'ol' : 'ul';
       const start = block.ordered && block.start !== 1 ? ` start="${block.start}"` : '';
       return `<${tag}${start}>\n${itemsHtml}</${tag}>\n`;
     }
     case 'table': {
       let headerHtml = '';
-      for (const cell of block.header) headerHtml += renderCell(cell, true, engine);
+      for (const cell of block.header) headerHtml += renderTableCell(cell, true, engine);
       const headRow = `<tr>\n${headerHtml}</tr>\n`;
       let bodyHtml = '';
       for (const row of block.rows) {
         let rowHtml = '';
-        for (const cell of row) rowHtml += renderCell(cell, false, engine);
+        for (const cell of row) rowHtml += renderTableCell(cell, false, engine);
         bodyHtml += `<tr>\n${rowHtml}</tr>\n`;
       }
       if (bodyHtml) bodyHtml = `<tbody>${bodyHtml}</tbody>`;
       return `<table>\n<thead>\n${headRow}</thead>\n${bodyHtml}</table>\n`;
     }
     case 'paragraph':
-      return `<p>${renderBlockInline(engine, block.text)}</p>\n`;
+      return `<p>${inlineHtml(engine, block.text)}</p>\n`;
     case 'text':
-      return renderBlockInline(engine, block.text);
+      return inlineHtml(engine, block.text);
     case 'checkbox':
       return `<input ${block.checked ? 'checked="" ' : ''}disabled="" type="checkbox"> `;
     default:
@@ -2108,8 +2124,8 @@ function renderBlock(block, engine) {
   }
 }
 
-function renderItem(item, engine) {
-  let inner = renderBlocks(item.tokens, engine);
+function renderListItem(item, engine) {
+  let inner = renderAllBlocks(item.tokens, engine);
   if (item.hasCheckbox) {
     const box = `<input ${item.checked ? 'checked="" ' : ''}disabled="" type="checkbox"> `;
     if (item.loose && inner.startsWith('<p>')) inner = '<p>' + box + inner.slice(3);
@@ -2118,28 +2134,28 @@ function renderItem(item, engine) {
   return `<li>${inner}</li>\n`;
 }
 
-function renderCell(cell, isHeader, engine) {
+function renderTableCell(cell, isHeader, engine) {
   const tag = isHeader ? 'th' : 'td';
   const align = cell.align ? ` align="${cell.align}"` : '';
-  return `<${tag}${align}>${renderBlockInline(engine, cell.text)}</${tag}>\n`;
+  return `<${tag}${align}>${inlineHtml(engine, cell.text)}</${tag}>\n`;
 }
 
-// ================================================================ 7. entry point
-// Fast path with a per-block fallback to marked (passed in as
-// `markedParse`). `src` is normalised (\r -> \n) first, like marked's
-// lex(). Short inputs go straight to marked: the fast path only pays
-// off on longer documents.
-function fastRender(src, markedParse) {
+// ================================================================ I. titik masuk
+// Jalur cepat dengan fallback per blok ke marked (diterima sebagai
+// `markedParse`). `src` dinormalisasi dulu (\r -> \n), seperti lex()
+// marked. Masukan pendek langsung ke marked: jalur cepat hanya
+// menguntungkan pada dokumen yang lebih panjang.
+function renderFast(src, markedParse) {
   const norm = src.replace(/\r\n?/g, '\n');
   if (norm.length < 2000) return markedParse(norm);
   const ctx = { links: {}, defs: [], top: true, mergePara: false };
-  const blocks = new BlockParser(norm, ctx).parse();
+  const blocks = new BlockLexer(norm, ctx).parse();
   const defsText = ctx.defs.map((d) => d.raw).join('');
-  const engine = new InlineEngine(ctx.links);
+  const engine = new Inline(ctx.links);
   let out = '';
   for (const block of blocks) {
     try {
-      out += renderBlock(block, engine);
+      out += renderOneBlock(block, engine);
     } catch (e) {
       out += markedParse(defsText + '\n' + block.raw);
     }
@@ -2147,18 +2163,18 @@ function fastRender(src, markedParse) {
   return out;
 }
 
-// Backwards-compatible wrappers around the classes above.
-function parseBlockList(src, ctx, blocks) {
-  return new BlockParser(src, ctx, blocks).parse();
+// Wrapper kompatibel-mundur di sekitar kelas di atas.
+function parseBlockTokens(src, ctx, blocks) {
+  return new BlockLexer(src, ctx, blocks).parse();
 }
-function renderInline(src, links, st, textMode = false) {
-  return new InlineEngine(links, st).render(src, textMode);
+function renderInlineText(src, links, st, textMode = false) {
+  return new Inline(links, st).render(src, textMode);
 }
-function readList(src, pos, ctx) {
-  return new BlockParser(src, ctx).readListAt(src, pos);
+function scanListAt(src, pos, ctx) {
+  return new BlockLexer(src, ctx).scanList(src, pos);
 }
-function readBlockquote(src, pos, ctx) {
-  return new BlockParser(src, ctx).readBlockquoteAt(src, pos);
+function scanQuoteAt(src, pos, ctx) {
+  return new BlockLexer(src, ctx).scanQuote(src, pos);
 }
 
-export { fastRender, parseBlockList, renderInline, readList, readBlockquote };
+export { renderFast, parseBlockTokens, renderInlineText, scanListAt, scanQuoteAt };
