@@ -1292,6 +1292,19 @@ function scanDefAt(src, pos) {
 //   mergePara: true when parsing blockquote inner content (only the FIRST
 //              paragraph of this call may merge into a previous paragraph)
 // blocks: array to append to (shared across blockquote groups)
+// Fence-closing regexes, cached per (fence char, fence length) instead of
+// rebuilding one for every line scanned inside a fenced code block.
+const REGEX_CACHE = new Map();
+function fenceCloseRegex(ch, len) {
+  const key = ch + len;
+  let rx = REGEX_CACHE.get(key);
+  if (!rx) {
+    rx = new RegExp('^(' + (ch === '`' ? '`' : '~') + '{' + len + ',})[ \\t]*$');
+    REGEX_CACHE.set(key, rx);
+  }
+  return rx;
+}
+
 function parseBlocks(src, ctx, blocks) {
   blocks = blocks || [];
   const { lines, starts } = splitLines(src);
@@ -1354,7 +1367,7 @@ function parseBlocks(src, ctx, blocks) {
       while (j < n) {
         const l2 = lines[j];
         const { rest: r2 } = stripUpTo3(l2);
-        const m = new RegExp('^(' + (fence.ch === '`' ? '`' : '~') + '{' + fence.len + ',})[ \\t]*$').exec(r2);
+        const m = fenceCloseRegex(fence.ch, fence.len).exec(r2);
         if (m) { closed = j; break; }
         j++;
       }
@@ -1526,7 +1539,8 @@ function parseHtmlBlock(lines, starts, src, i, type) {
   const { rest } = stripUpTo3(first);
   if (type === 1) {
     const tag = /^<(script|pre|style|textarea)/i.exec(rest)[1].toLowerCase();
-    const closeRe = new RegExp('</' + tag + '>', 'i');
+    let closeRe = REGEX_CACHE.get('html/' + tag);
+    if (!closeRe) { closeRe = new RegExp('</' + tag + '>', 'i'); REGEX_CACHE.set('html/' + tag, closeRe); }
     let j = i;
     let found = false;
     while (j < n) {
