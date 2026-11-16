@@ -14,7 +14,5 @@ import { fastParse } from './fast.js';
 
 /** The HTML marked 18.1.3 renders for `markdown`, with marked's defaults. */
 export function parse(markdown) {
-  const fast = fastParse(markdown);
-  if (fast !== null) return fast;
-  return marked.parse(markdown);
+  return fastParse(markdown, (s) => marked.parse(s));
 }
